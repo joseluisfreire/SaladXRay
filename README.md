@@ -19,7 +19,7 @@ If you want to compile Salad XRay from the source code, you'll need the [.NET 8.
 In your elevated PowerShell window, run:
 
 ```powershell
-git clone https://github.com/YourUsername/SaladXRayPanel.git
+git clone https://github.com/joseluisfreire/SaladXRayPanel.git
 cd SaladXRayPanel
 ```
 
