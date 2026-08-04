@@ -19,8 +19,8 @@ If you want to compile Salad XRay from the source code, you'll need the [.NET 8.
 In your elevated PowerShell window, run:
 
 ```powershell
-git clone https://github.com/joseluisfreire/SaladXRayPanel.git
-cd SaladXRayPanel
+git clone https://github.com/joseluisfreire/SaladXRay.git
+cd SaladXRay
 ```
 
 ### 2. Install Required Dependencies
@@ -42,7 +42,7 @@ dotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=
 
 ### 4. Locate your .exe
 
-Once the build is complete, your fresh `SaladXRayPanel.exe` will be located in: 
+Once the build is complete, your fresh `SaladXRay.exe` will be located in: 
 `\bin\Release\net8.0\win-x64\publish\`
 
 Just run the `.exe` as **Administrator** (to ensure it can read all hardware sensors properly) and enjoy the X-Ray vision!
