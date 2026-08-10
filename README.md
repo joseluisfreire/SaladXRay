@@ -45,4 +45,4 @@ dotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=
 Once the build is complete, your fresh `SaladXRay.exe` will be located in: 
 `\bin\Release\net8.0\win-x64\publish\`
 
-Just run the `.exe` as **Administrator** (to ensure it can read all hardware sensors properly) and enjoy the X-Ray vision!
+Just run the `.exe` and enjoy the X-Ray vision!
