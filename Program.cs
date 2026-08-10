@@ -31,6 +31,18 @@ namespace SaladXRayPanel
         // AMD GPU LOAD
         static List<PerformanceCounter> amdGpuCounters = null;
         static bool amdCountersInitFailed = false;
+        static double currentGpuLoadPct = 0;
+
+	// New Heuristic Miner Detection (engine-type based)
+	static Dictionary<string, PerformanceCounter> gpuEngineCounters = new();
+	static PerformanceCounterCategory gpuEngineCategory;
+	static DateTime lastGpuEngineRefresh = DateTime.MinValue;
+	static bool gpuEngineCountersInitFailed = false;
+	static readonly Dictionary<int, string> minerScopeCache = new();
+	static readonly Dictionary<int, (bool result, DateTime cachedAt)> saladTreeCache = new();
+	static readonly TimeSpan SaladTreeCacheTtl = TimeSpan.FromMinutes(2);
+
+	static DateTime lastMinerCacheClear = DateTime.MinValue;
 
         static bool showHelpScreen = false; // Help/About screen control
         static FigletFont embeddedFont = null;
@@ -45,7 +57,14 @@ namespace SaladXRayPanel
         static string txtDisk = "Computing...";
         static string minerStatus = "[grey]Idle[/]", bandwidthStatus = "[grey]Idle[/]";
         static string lastWarning = "No recent errors detected in the current session.";
+        static string lastErrorLevel = "";
 
+	//windows detect
+	static string osDisplayName = "Detecting...";
+	static bool isLegacyEmojiMode = false;
+	private static readonly Regex EmojiShortcodeRegex = new(@":[a-z0-9_]+:");
+	private static readonly Dictionary<string, string> _adaptIconCache = new();
+	
         // Human-readable Matrix status (Salad Backend)
         static string matrixStatus = "[grey]Waiting for matrix data...[/]";
 
@@ -56,6 +75,58 @@ namespace SaladXRayPanel
         static string gpuNetworkUtil = "[grey]Waiting...[/]";
         static DateTime lastGpuDemandUpdate = DateTime.MinValue;
         static bool isFetchingDemand = false;
+        static readonly HttpClient httpClient = CreateHttpClient();
+
+        static readonly string SaladLogDirectory = ResolveSaladLogDirectory();
+
+        static string ResolveSaladLogDirectory()
+        {
+            var programData = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
+            var candidate = Path.Combine(programData, "Salad", "logs");
+            if (Directory.Exists(candidate))
+                return candidate;
+
+            try
+            {
+                using var key = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Salad Technologies\Salad");
+                var installPath = key?.GetValue("InstallLocation") as string;
+                if (!string.IsNullOrWhiteSpace(installPath))
+                {
+                    var regCandidate = Path.Combine(installPath, "logs");
+                    if (Directory.Exists(regCandidate))
+                        return regCandidate;
+                }
+            }
+            catch { }
+
+            return candidate; // fallback, mesmo sem existir ainda
+        }
+
+	static string GenerateProgressBar(double percent, int barLength = 20)
+	{
+	    // Garante que a porcentagem fique entre 0 e 100
+	    if (percent < 0) percent = 0;
+	    if (percent > 100) percent = 100;
+
+	    // Calcula quantos blocos "cheios" a barra vai ter
+	    int filledBlocks = (int)Math.Round((percent / 100.0) * barLength);
+	    int emptyBlocks = barLength - filledBlocks;
+
+	    // Desenha a barra com caracteres Unicode
+	    string filled = new string('█', filledBlocks);
+	    string empty = new string('░', emptyBlocks);
+
+	    // Retorna a barra colorida em verde e cinza usando o Markup do Spectre
+	    return $"[green]{filled}[/][grey]{empty}[/]";
+	}
+
+        static HttpClient CreateHttpClient()
+        {
+            var client = new HttpClient();
+            client.Timeout = TimeSpan.FromSeconds(10);
+            client.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 SaladXRayPanel/1.0");
+            return client;
+        }
 
         // Download and Unpacking Tracking Variables
         static bool isPullingState = false;
@@ -127,62 +198,106 @@ namespace SaladXRayPanel
             catch { /* IF ERROR */ }
             // ==========================================
 
-            string logsFolder = @"C:\ProgramData\Salad\logs\";
+            string logsFolder = SaladLogDirectory + Path.DirectorySeparatorChar;
 
             RestoreInitialState(logsFolder);
             UpdateSaladInfo();
+            DetectWindowsVersion();
 
-            while (true)
-            {
-                string logFile = GetMostRecentLogFile(logsFolder);
-                if (logFile == null) logFile = $"log-{DateTime.Now:yyyyMMdd}.txt (Not Found)";
+            string logFile = GetMostRecentLogFile(logsFolder);
+            if (logFile == null) logFile = $"log-{DateTime.Now:yyyyMMdd}.txt (Not Found)";
 
-                await AnsiConsole.Live(RenderPanel(logFile))
-                    .Cropping(VerticalOverflowCropping.Bottom)
-                    .StartAsync(async ctx =>
+            await AnsiConsole.Live(RenderPanel(logFile))
+                .Cropping(VerticalOverflowCropping.Bottom)
+                .StartAsync(async ctx =>
+                {
+                    int loopCounter = 0;
+                    while (true)
                     {
-                        int loopCounter = 0;
-                        while (true)
+			string foundLog = GetMostRecentLogFile(logsFolder);
+			if (foundLog != null)
+			{
+			    logFile = foundLog;
+			    ReadSaladLogs(logFile);
+			}
+
+                        if (loopCounter % 2 == 0)
                         {
-                            logFile = GetMostRecentLogFile(logsFolder);
-                            if (logFile != null) ReadSaladLogs(logFile);
-
-                            if (loopCounter % 2 == 0)
-                            {
-                                UpdateHostHardware();
-                                UpdateWSLData();
-                                UpdateNetwork();
-                                UpdateSaladInfo();
-                                _ = FetchGpuDemandDataAsync();
-                            }
-
-                            CalculateUptime();
-                            ctx.UpdateTarget(RenderPanel(logFile));
-
-                            loopCounter++;
-
-                            // Check keyboard input
-                            for (int i = 0; i < 10; i++)
-                            {
-                                if (!Console.IsInputRedirected && Console.KeyAvailable)
-                                {
-                                    var key = Console.ReadKey(true);
-                                    if (key.Key == ConsoleKey.Escape)
-                                    {
-                                        Console.CursorVisible = true;
-                                        Environment.Exit(0);
-                                    }
-                                    else if (key.Key == ConsoleKey.H)
-                                    {
-                                        showHelpScreen = !showHelpScreen;
-                                        ctx.UpdateTarget(RenderPanel(logFile));
-                                    }
-                                }
-                                await Task.Delay(100);
-                            }
+                            UpdateNetwork();
+                            UpdateSaladInfo();
+                            _ = FetchGpuDemandDataAsync();
                         }
-                    });
+
+                        if (loopCounter % 10 == 0)
+                        {
+                            UpdateHostHardware();
+                            UpdateWSLData();
+                        }
+
+                        CalculateUptime();
+                        ctx.UpdateTarget(RenderPanel(logFile));
+
+                        loopCounter++;
+
+                        // Check keyboard input
+                        for (int i = 0; i < 10; i++)
+                        {
+                            if (!Console.IsInputRedirected && Console.KeyAvailable)
+                            {
+                                var key = Console.ReadKey(true);
+                                if (key.Key == ConsoleKey.Escape)
+                                {
+                                    Console.CursorVisible = true;
+                                    DisposeGpuEngineCounters();
+                                    Environment.Exit(0);
+                                }
+                                else if (key.Key == ConsoleKey.H)
+                                {
+                                    showHelpScreen = !showHelpScreen;
+                                    ctx.UpdateTarget(RenderPanel(logFile));
+                                }
+                            }
+                            await Task.Delay(100);
+                        }
+                    }
+                });
+        }
+
+        private static readonly Regex WhitespaceRegex = new(@"\s+", RegexOptions.Compiled);
+
+        private static string NormalizeGpuName(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name)) return string.Empty;
+            return WhitespaceRegex.Replace(name.Trim(), " ").ToUpperInvariant();
+        }
+
+        private static GpuDemandData FindMatchingGpu(string localGpuName, IEnumerable<GpuDemandData> apiItems)
+        {
+            if (string.IsNullOrWhiteSpace(localGpuName)) return null;
+            var normalizedLocal = NormalizeGpuName(localGpuName);
+
+            foreach (var item in apiItems)
+            {
+                if (NormalizeGpuName(item.Name) == normalizedLocal) return item;
+                if (NormalizeGpuName(item.DisplayName) == normalizedLocal) return item;
+                if (item.VariantNames != null)
+                {
+                    foreach (var variant in item.VariantNames)
+                    {
+                        if (!string.IsNullOrWhiteSpace(variant) && NormalizeGpuName(variant) == normalizedLocal)
+                            return item;
+                    }
+                }
             }
+
+            foreach (var item in apiItems)
+            {
+                var normName = NormalizeGpuName(item.Name);
+                if (normName.Contains(normalizedLocal) || normalizedLocal.Contains(normName))
+                    return item;
+            }
+
+            return null;
         }
 
         static async Task FetchGpuDemandDataAsync()
@@ -208,43 +323,37 @@ namespace SaladXRayPanel
                         return;
                     }
 
-                    using (var client = new HttpClient())
+                    string json = await httpClient.GetStringAsync("https://app-api.salad.com/api/v2/demand-monitor/gpu");
+
+                    var options = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+                    var gpus = JsonSerializer.Deserialize<List<GpuDemandData>>(json, options);
+
+                    var myGpu = FindMatchingGpu(localGpuName, gpus ?? new List<GpuDemandData>());
+
+                    if (myGpu != null)
                     {
-                        client.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 SaladXRayPanel/1.0");
-                        string json = await client.GetStringAsync("https://app-api.salad.com/api/v2/demand-monitor/gpu");
+                        gpuDemandStatus = $"[bold green]{myGpu.DisplayName}[/]";
+                        gpuDemandTier = $"[cyan]{myGpu.DemandTierName}[/] (Recommended Host RAM: {myGpu.RecommendedSpecs?.RamGb}GB)";
 
-                        var options = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
-                        var gpus = JsonSerializer.Deserialize<List<GpuDemandData>>(json, options);
+                        double realBusyPct = myGpu.UtilizationPct;
+                        if (realBusyPct < 0) realBusyPct = 0;
+                        if (realBusyPct > 100) realBusyPct = 100;
 
-                        var myGpu = gpus?.FirstOrDefault(g =>
-                            (g.Name != null && g.Name.Equals(localGpuName, StringComparison.OrdinalIgnoreCase)) ||
-                            (g.DisplayName != null && g.DisplayName.Equals(localGpuName, StringComparison.OrdinalIgnoreCase)));
+                        gpuNetworkUtil = $"[yellow]{Math.Round(realBusyPct, 1)}%[/] of active machines working";
 
-                        if (myGpu != null)
+                        if (myGpu.EarningRates != null)
                         {
-                                gpuDemandStatus = $"[bold green]{myGpu.DisplayName}[/]";
-                                gpuDemandTier = $"[cyan]{myGpu.DemandTierName}[/] (Min RAM: {myGpu.RecommendedSpecs?.RamGb}GB)";
-
-double realBusyPct = myGpu.UtilizationPct;
-if (realBusyPct < 0) realBusyPct = 0;
-if (realBusyPct > 100) realBusyPct = 100;
-
-gpuNetworkUtil = $"[yellow]{Math.Round(realBusyPct, 1)}%[/] of active machines working";
-
-                            if (myGpu.EarningRates != null)
-                            {
-                                double avg24h = myGpu.EarningRates.AvgEarningRate * 24;
-                                double max24h = myGpu.EarningRates.MaxEarningRate * 24;
-                                gpuEarning24h = $"Avg: [bold green]${avg24h:F2}[/] / Max Pico: [bold green]${max24h:F2}[/] (24h)";
-                            }
+                            double avg24h = myGpu.EarningRates.AvgEarningRate * 24;
+                            double max24h = myGpu.EarningRates.MaxEarningRate * 24;
+                            gpuEarning24h = $"Avg: [bold green]${avg24h:F2}[/] / Max Pico: [bold green]${max24h:F2}[/]";
                         }
-                        else
-                        {
-                            gpuDemandStatus = $"[darkorange]Not Listed[/] [grey]({localGpuName})[/]";
-                            gpuDemandTier = "[grey]Low/No Demand[/]";
-                            gpuNetworkUtil = "[grey]N/A[/]";
-                            gpuEarning24h = "[grey]N/A[/]";
-                        }
+                    }
+                    else
+                    {
+                        gpuDemandStatus = $"[darkorange]Not Listed[/] [grey]({localGpuName})[/]";
+                        gpuDemandTier = "[grey]Low/No Demand[/]";
+                        gpuNetworkUtil = "[grey]N/A[/]";
+                        gpuEarning24h = "[grey]N/A[/]";
                     }
                 });
 
@@ -261,20 +370,55 @@ gpuNetworkUtil = $"[yellow]{Math.Round(realBusyPct, 1)}%[/] of active machines w
             }
         }
 
-        static void UpdateSaladInfo()
-        {
-            try
-            {
-                int myProcessId = Process.GetCurrentProcess().Id;
+	static void DetectWindowsVersion()
+	{
+	    try
+	    {
+	        using var key = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion");
+	        string productName = key?.GetValue("ProductName")?.ToString() ?? "Windows";
+	        string buildStr = key?.GetValue("CurrentBuildNumber")?.ToString() ?? "0";
+	        int build = int.TryParse(buildStr, out int b) ? b : 0;
 
-                var processes = Process.GetProcesses()
-                    .Where(p => p.ProcessName.StartsWith("salad", StringComparison.OrdinalIgnoreCase)
-                             && p.Id != myProcessId
-                             && !p.ProcessName.Contains("XRay", StringComparison.OrdinalIgnoreCase))
-                    .ToList();
+	        // Windows 11 reporta build >= 22000, mas o registro ainda chama de "Windows 10"
+	        if (build >= 22000)
+	        {
+	            productName = productName.Replace("Windows 10", "Windows 11");
+	            isLegacyEmojiMode = false;
+	        }
+	        else
+	        {
+	            isLegacyEmojiMode = true;
+	        }
 
-                if (processes.Count > 0)
-                {
+	        string displayVersion = key?.GetValue("DisplayVersion")?.ToString() ?? "";
+	        osDisplayName = string.IsNullOrEmpty(displayVersion)
+	            ? $"{productName} (Build {build})"
+	            : $"{productName} {displayVersion} (Build {build})";
+	    }
+	    catch
+	    {
+	        osDisplayName = "Unknown Windows";
+	        isLegacyEmojiMode = false;
+	    }
+	}
+
+	static void UpdateSaladInfo()
+	{
+	    Process[] allProcesses = null;
+	    try
+	    {
+	        using var currentProc = Process.GetCurrentProcess();
+	        int myProcessId = currentProc.Id;
+
+	        allProcesses = Process.GetProcesses();
+	        var processes = allProcesses
+	            .Where(p => p.ProcessName.StartsWith("salad", StringComparison.OrdinalIgnoreCase)
+	                     && p.Id != myProcessId
+	                     && !p.ProcessName.Contains("XRay", StringComparison.OrdinalIgnoreCase))
+	            .ToList();
+
+	        if (processes.Count > 0)
+	        {
                     DateTime? mainAppStart = null;
                     DateTime? bowlServiceStart = null;
                     string mainAppPath = null;
@@ -379,13 +523,18 @@ gpuNetworkUtil = $"[yellow]{Math.Round(realBusyPct, 1)}%[/] of active machines w
                     saladStartTime = DateTime.MinValue;
                     saladBowlStartTime = DateTime.MinValue;
                     saladBowlVersion = "Offline";
-                }
-            }
-            catch { }
+	        }
+	    }
+	    catch { }
+	    finally
+	    {
+	        if (allProcesses != null)
+	            foreach (var p in allProcesses) p.Dispose();
+	    }
 
-            try
-            {
-                string[] possibleRegistryKeys = {
+	    try
+	    {
+	        string[] possibleRegistryKeys = {
                     @"Software\Microsoft\Windows\CurrentVersion\Uninstall\Salad",
                     @"Software\Microsoft\Windows\CurrentVersion\Uninstall\Salad (AMD Edition)"
                 };
@@ -512,13 +661,13 @@ gpuNetworkUtil = $"[yellow]{Math.Round(realBusyPct, 1)}%[/] of active machines w
             }
 
             var matchWorkload = Regex.Match(line, @"salad\.com/sce/([a-f0-9\-]+)");
-            if (matchWorkload.Success)
-            {
+            if (matchWorkload.Success && !line.Contains("TTL =") && !line.Contains("pullDuration"))
+                        {
                 string newJobId = matchWorkload.Groups[1].Value;
                 if (jobId != newJobId)
                 {
                     jobId = newJobId;
-                    if (!isStartup) jobStartTime = FindRealJobStartTime(newJobId, @"C:\ProgramData\Salad\logs\");
+                    if (!isStartup) jobStartTime = FindRealJobStartTime(newJobId, SaladLogDirectory + Path.DirectorySeparatorChar);
                     containerStatus = "Starting..."; matrixStatus = "[yellow]Initializing new job...[/]";
                     initialPercentTracker = -1; initialMbTracker = 0; lastEstimatedMB = 0; totalPullingMB = 0; isPullingState = false;
                     globalProgress = 0.0;
@@ -606,7 +755,8 @@ gpuNetworkUtil = $"[yellow]{Math.Round(realBusyPct, 1)}%[/] of active machines w
                         physicalStr = $"{physicalStr} (Syncing Size...)";
                     }
 
-                    containerStatus = $"[yellow]Global: {percentage}% | ?Layer? [[{activeLayer}]] | DL: {physicalStr}{etaStr}[/]";
+			string visualBar = GenerateProgressBar(percentage);
+			containerStatus = $"{visualBar} [yellow]{percentage}% | {physicalStr}{etaStr}[/]";
                 }
             }
 
@@ -621,6 +771,7 @@ gpuNetworkUtil = $"[yellow]{Math.Round(realBusyPct, 1)}%[/] of active machines w
                 {
                     isPullingState = false;
                     containerStatus = "[grey]Stopped / Waiting[/]";
+                    matrixStatus = "[grey]Idle - Searching for jobs...[/]";
                     globalProgress = 0.0;
                 }
             }
@@ -630,11 +781,15 @@ gpuNetworkUtil = $"[yellow]{Math.Round(realBusyPct, 1)}%[/] of active machines w
 
             if (line.Contains("Stopping workload") && line.Contains("Bandwidth")) { bandwidthStatus = "[grey]Idle[/]"; sgsNodeName = "Waiting for node..."; }
 
-            if (line.Contains("[WRN]") || line.Contains("[ERR]") || line.Contains("failed"))
-            {
-                var matchError = Regex.Match(line, @"\]\s+(.*)");
-                lastWarning = matchError.Success ? (matchError.Groups[1].Value.Length > 85 ? matchError.Groups[1].Value.Substring(0, 82) + "..." : matchError.Groups[1].Value) : line;
-            }
+		if (line.Contains("[WRN]") || line.Contains("[ERR]"))
+		{
+		    string level = line.Contains("[ERR]") ? "ERR" : "WRN";
+		    var matchError = Regex.Match(line, @"\[(?:WRN|ERR)\]\s+(.*)");
+		    string rawMsg = matchError.Success ? matchError.Groups[1].Value : line;
+
+		    lastErrorLevel = level;
+		    lastWarning = rawMsg.Length > 85 ? rawMsg.Substring(0, 82) + "..." : rawMsg;
+		}
 
             if (line.Contains("Heartbeat"))
             {
@@ -680,18 +835,23 @@ gpuNetworkUtil = $"[yellow]{Math.Round(realBusyPct, 1)}%[/] of active machines w
             } catch { }
 
             long currentSgsRx = 0, currentSgsTx = 0, currentSgsRam = 0; bool isProcessFound = false;
+            Process[] allSgsScan = Process.GetProcesses();
             try
             {
-                var sgsProcs = Process.GetProcesses().Where(p => p.ProcessName.StartsWith("sgs", StringComparison.OrdinalIgnoreCase) || p.ProcessName.StartsWith("v2ray", StringComparison.OrdinalIgnoreCase) || p.ProcessName.StartsWith("ss-local", StringComparison.OrdinalIgnoreCase)).ToList();
+                var sgsProcs = allSgsScan.Where(p => p.ProcessName.StartsWith("sgs", StringComparison.OrdinalIgnoreCase) || p.ProcessName.StartsWith("v2ray", StringComparison.OrdinalIgnoreCase) || p.ProcessName.StartsWith("ss-local", StringComparison.OrdinalIgnoreCase)).ToList();
                 if (sgsProcs.Count > 0)
                 {
                     isProcessFound = true; currentSgsRam = sgsProcs.Sum(p => p.WorkingSet64);
                     string wqlPids = string.Join(" OR ", sgsProcs.Select(p => $"ProcessId={p.Id}"));
                     using (ManagementObjectSearcher searcher = new ManagementObjectSearcher($"SELECT ReadTransferCount, WriteTransferCount FROM Win32_Process WHERE {wqlPids}"))
+                    using (ManagementObjectCollection results = searcher.Get())
                     {
-                        foreach (ManagementObject obj in searcher.Get())
+                        foreach (ManagementObject obj in results)
                         {
-                            currentSgsRx += Convert.ToInt64(obj["ReadTransferCount"] ?? 0); currentSgsTx += Convert.ToInt64(obj["WriteTransferCount"] ?? 0);
+                            using (obj)
+                            {
+                                currentSgsRx += Convert.ToInt64(obj["ReadTransferCount"] ?? 0); currentSgsTx += Convert.ToInt64(obj["WriteTransferCount"] ?? 0);
+                            }
                         }
                     }
                 }
@@ -716,8 +876,13 @@ gpuNetworkUtil = $"[yellow]{Math.Round(realBusyPct, 1)}%[/] of active machines w
                     lastSgsRx = currentSgsRx; lastSgsTx = currentSgsTx; lastSgsTime = now;
                 }
                 else { sgsDetails = "[grey]Network process idle or waiting...[/]"; lastSgsTime = DateTime.MinValue; }
-            } catch { }
-        }
+            }
+            catch { }
+            finally
+            {
+                foreach (var p in allSgsScan) p.Dispose();
+            }
+	}
 
         static void CalculateUptime()
         {
@@ -736,6 +901,41 @@ gpuNetworkUtil = $"[yellow]{Math.Round(realBusyPct, 1)}%[/] of active machines w
                 lastUpdateTimer = $"{(int)diff.TotalMinutes}m {diff.Seconds}s";
             }
         }
+
+	static DriveInfo cachedDrive = null;
+	static string cachedDriveRoot = null;
+	static string cachedDiskFreeStr = null;
+	static DateTime lastDiskFreeCheck = DateTime.MinValue;
+
+	static string GetDiskFreeSpaceStr()
+	{
+	    if (cachedDiskFreeStr != null && (DateTime.Now - lastDiskFreeCheck).TotalSeconds < 5)
+	        return cachedDiskFreeStr;
+
+	    try
+	    {
+	        string rootPath = Path.GetPathRoot(SaladLogDirectory) ?? "C:\\";
+	        if (cachedDrive == null || cachedDriveRoot != rootPath)
+	        {
+	            cachedDrive = new DriveInfo(rootPath);
+	            cachedDriveRoot = rootPath;
+	        }
+
+	        double freeGb = cachedDrive.AvailableFreeSpace / 1073741824.0;
+	        double freeRounded = Math.Round(freeGb, 1);
+
+	        string color = freeGb < 10 ? "red bold" : "white";
+	        cachedDiskFreeStr = $"[{color}]Free: {freeRounded} GB[/]";
+	    }
+	    catch
+	    {
+	        cachedDrive = null;
+	        cachedDiskFreeStr = "[grey]Free: N/A[/]";
+	    }
+
+	    lastDiskFreeCheck = DateTime.Now;
+	    return cachedDiskFreeStr;
+	}
 
         static void LoadDiskInfo()
         {
@@ -790,72 +990,322 @@ gpuNetworkUtil = $"[yellow]{Math.Round(realBusyPct, 1)}%[/] of active machines w
             catch { isDiskInfoLoaded = true; }
         }
 
-
-static double GetAmdGpuUtilization()
-{
-    if (amdCountersInitFailed) return -1;
-
-    try
-    {
-        if (amdGpuCounters == null)
+        static double GetAmdGpuUtilization()
         {
-            var category = new PerformanceCounterCategory("GPU Engine");
-            var instances = category.GetInstanceNames()
-                .Where(i => i.Contains("engtype_3D") || i.Contains("engtype_Compute"))
-                .ToArray();
+            if (amdCountersInitFailed) return -1;
 
-            amdGpuCounters = new List<PerformanceCounter>();
-            foreach (var instance in instances)
+            try
             {
-                foreach (var c in category.GetCounters(instance))
+                if (amdGpuCounters == null)
                 {
-                    if (c.CounterName == "Utilization Percentage")
-                        amdGpuCounters.Add(c);
-                }
-            }
+                    var category = new PerformanceCounterCategory("GPU Engine");
+                    var instances = category.GetInstanceNames()
+                        .Where(i => i.Contains("engtype_3D") || i.Contains("engtype_Compute"))
+                        .ToArray();
 
-            if (amdGpuCounters.Count == 0)
+                    amdGpuCounters = new List<PerformanceCounter>();
+                    foreach (var instance in instances)
+                    {
+                        foreach (var c in category.GetCounters(instance))
+                        {
+                            if (c.CounterName == "Utilization Percentage")
+                                amdGpuCounters.Add(c);
+                        }
+                    }
+
+                    if (amdGpuCounters.Count == 0)
+                    {
+                        amdCountersInitFailed = true;
+                        return -1;
+                    }
+
+                    // First reading is always 0, so discard it and return -1 this time.
+                    foreach (var c in amdGpuCounters) c.NextValue();
+                    return -1;
+                }
+
+                double total = amdGpuCounters.Sum(c => c.NextValue());
+                if (total > 100) total = 100;
+                if (total < 0) total = 0;
+                return Math.Round(total, 1);
+            }
+            catch
             {
                 amdCountersInitFailed = true;
                 return -1;
             }
-
-            // First reading is always 0, so discard it and return -1 this time.
-            foreach (var c in amdGpuCounters) c.NextValue();
-            return -1;
         }
 
-        double total = amdGpuCounters.Sum(c => c.NextValue());
-        if (total > 100) total = 100;
-        if (total < 0) total = 0;
-        return Math.Round(total, 1);
-    }
-    catch
-    {
-        amdCountersInitFailed = true;
-        return -1;
-    }
-}
+        // ==========================================
+        // SALAD PROCESS TREE EXCLUSION
+        // ==========================================
+	        static readonly HashSet<string> SaladRootProcessNames = new(StringComparer.OrdinalIgnoreCase)
+	{
+	    "salad", "salad (amd edition)", "salad.bowl.service",
+	    "wsl", "wslhost", "vmmemwsl", "vmmem",
+	    "wslservice", "wslrelay", "lxssmanager", "hvsimhost"
+	};
+
+	static Dictionary<int, (int parentPid, string name)> processTreeSnapshot = new();
+	static DateTime lastProcessTreeSnapshot = DateTime.MinValue;
+	static readonly TimeSpan ProcessTreeSnapshotTtl = TimeSpan.FromSeconds(10);
+
+	static void RefreshProcessTreeSnapshotIfNeeded()
+	{
+	    if ((DateTime.Now - lastProcessTreeSnapshot) < ProcessTreeSnapshotTtl && processTreeSnapshot.Count > 0)
+	        return;
+
+	    var snapshot = new Dictionary<int, (int parentPid, string name)>();
+	    try
+	    {
+	        using var searcher = new ManagementObjectSearcher("SELECT ProcessId, ParentProcessId, Name FROM Win32_Process");
+	        using var results = searcher.Get();
+	        foreach (ManagementObject mo in results)
+	        {
+	            try
+	            {
+	                int pid = Convert.ToInt32(mo["ProcessId"]);
+	                int parentPid = 0;
+	                try { parentPid = Convert.ToInt32(mo["ParentProcessId"]); } catch { }
+	                string name = Path.GetFileNameWithoutExtension(mo["Name"]?.ToString() ?? "");
+	                snapshot[pid] = (parentPid, name);
+	            }
+	            finally { mo.Dispose(); }
+	        }
+	    }
+	    catch { return; }
+
+	    processTreeSnapshot = snapshot;
+	    lastProcessTreeSnapshot = DateTime.Now;
+	}
+
+	static bool IsUnderSaladTree(int pid)
+	{
+	    RefreshProcessTreeSnapshotIfNeeded();
+
+	    var visited = new HashSet<int>();
+	    int currentPid = pid;
+
+	    while (currentPid > 0 && visited.Add(currentPid))
+	    {
+	        if (!processTreeSnapshot.TryGetValue(currentPid, out var info))
+	            break;
+
+	        if (SaladRootProcessNames.Contains(info.name)) return true;
+	        currentPid = info.parentPid;
+	    }
+	    return false;
+	}
+
+	static bool IsUnderSaladTreeCached(int pid)
+	{
+	    if (saladTreeCache.TryGetValue(pid, out var cached) &&
+	        (DateTime.Now - cached.cachedAt) < SaladTreeCacheTtl)
+	    {
+	        return cached.result;
+	    }
+
+	    bool result = IsUnderSaladTree(pid);
+	    saladTreeCache[pid] = (result, DateTime.Now);
+	    return result;
+	}
+
+        static string ClassifyMinerScope(int pid, string processName)
+        {
+            if (minerScopeCache.TryGetValue(pid, out string cached)) return cached;
+
+            bool internalScope = IsUnderSaladTree(pid);
+            string scope = internalScope ? "INTERNAL" : "EXTERNAL";
+            minerScopeCache[pid] = scope;
+            return scope;
+        }
+
+        // ==========================================
+        // GPU ENGINE HEURISTIC (SUSPECTED MINER DETECTION)
+        // ==========================================
+        static readonly Regex GpuEngineInstanceRegex = new(
+            @"pid_(?<pid>\d+)_.*_engtype_(?<type>\w+)",
+            RegexOptions.Compiled);
+
+        static bool TryParseGpuEngineInstance(string instanceName, out int pid, out string engineType)
+        {
+            var m = GpuEngineInstanceRegex.Match(instanceName);
+            if (m.Success)
+            {
+                pid = int.Parse(m.Groups["pid"].Value);
+                engineType = m.Groups["type"].Value;
+                return true;
+            }
+            pid = 0;
+            engineType = null;
+            return false;
+        }
+
+        static void RefreshGpuEngineCounters()
+        {
+            if (gpuEngineCountersInitFailed) return;
+
+            try
+            {
+                gpuEngineCategory ??= new PerformanceCounterCategory("GPU Engine");
+                var currentInstances = gpuEngineCategory.GetInstanceNames();
+
+                var toRemove = gpuEngineCounters.Keys.Except(currentInstances).ToList();
+                foreach (var key in toRemove)
+                {
+                    gpuEngineCounters[key].Dispose();
+                    gpuEngineCounters.Remove(key);
+                }
+
+                foreach (var inst in currentInstances)
+                {
+                    if (!gpuEngineCounters.ContainsKey(inst))
+                    {
+                        try
+                        {
+                            var counter = new PerformanceCounter("GPU Engine", "Utilization Percentage", inst, readOnly: true);
+                            gpuEngineCounters[inst] = counter;
+                        }
+                        catch { }
+                    }
+                }
+
+                lastGpuEngineRefresh = DateTime.Now;
+            }
+            catch
+            {
+                gpuEngineCountersInitFailed = true;
+            }
+        }
+
+        static Dictionary<(int pid, string type), float> GetGpuUsageByPidAndEngine()
+        {
+            var result = new Dictionary<(int, string), float>();
+
+            if (gpuEngineCountersInitFailed) return result;
+
+            if ((DateTime.Now - lastGpuEngineRefresh).TotalSeconds > 5)
+                RefreshGpuEngineCounters();
+
+            foreach (var kvp in gpuEngineCounters)
+            {
+                if (!TryParseGpuEngineInstance(kvp.Key, out int pid, out string type))
+                    continue;
+
+                float value;
+                try { value = kvp.Value.NextValue(); }
+                catch { continue; }
+
+                var key = (pid, type);
+                result[key] = result.TryGetValue(key, out var existing) ? existing + value : value;
+            }
+
+            return result;
+        }
+
+        static string ClassifyProcessGpuBehavior(int pid, Dictionary<(int, string), float> usageMap)
+        {
+            float pct3D = usageMap.TryGetValue((pid, "3D"), out var v1) ? v1 : 0f;
+            float pctCompute = usageMap.TryGetValue((pid, "Compute"), out var v2) ? v2 : 0f;
+            float pctVideoEnc = usageMap.TryGetValue((pid, "VideoEncode"), out var v3) ? v3 : 0f;
+
+            if (pctCompute > 30 && pct3D < 5 && pctVideoEnc < 5)
+                return "SUSPECTED_MINER";
+            if (pct3D > 15)
+                return "GAME_OR_RENDER";
+            if (pctCompute > 5 || pct3D > 5)
+                return "UNKNOWN_GPU_APP";
+            return "IDLE";
+        }
+
+        static void DisposeGpuEngineCounters()
+        {
+            foreach (var c in gpuEngineCounters.Values) c.Dispose();
+            gpuEngineCounters.Clear();
+        }
 
         static void UpdateHostHardware()
         {
             try
             {
-            string[] minerNames = { "t-rex", "trex", "gminer", "srbminer", "xmrig", "nbminer", "lolminer", "excavator", "rigel", "bzminer", "phoenixminer", "miner" };
+                string[] minerNames = { "t-rex", "trex", "gminer", "srbminer", "xmrig", "nbminer", "lolminer", "excavator", "rigel", "bzminer", "phoenixminer", "miner" };
                 bool minerFound = false;
+                int knownMinerPid = -1;
 
+                // 1ª checagem: nome conhecido de miner
                 foreach (string mName in minerNames)
                 {
                     Process[] procs = Process.GetProcessesByName(mName);
                     if (procs.Length > 0)
                     {
-                        minerStatus = $"[yellow][[ ACTIVE - {procs[0].ProcessName.ToUpper()} ]][/]";
+                        var proc = procs[0];
+                        knownMinerPid = proc.Id;
+                        string scope = ClassifyMinerScope(proc.Id, proc.ProcessName);
+                        string color = scope == "INTERNAL" ? "cyan" : "orange3";
+
+                        minerStatus = $"[{color}][[ {scope} MINER - {proc.ProcessName.ToUpper()} ]][/]";
                         minerFound = true;
+
+                        foreach (var p in procs) p.Dispose();
                         break;
                     }
                 }
 
-                if (!minerFound) { minerStatus = "[grey]Idle[/]"; }
+                // 2ª checagem: heurística de comportamento (Compute alto, 3D baixo)
+                // Só roda se a GPU estiver com carga relevante — evita gasto constante em idle
+                if (!minerFound && currentGpuLoadPct >= 40)
+                {
+                    var gpuUsageMap = GetGpuUsageByPidAndEngine();
+                    var distinctPids = gpuUsageMap.Keys.Select(k => k.Item1).Distinct();
+                    int myProcessId = Process.GetCurrentProcess().Id;
+
+			foreach (int pid in distinctPids)
+			{
+			    if (pid == myProcessId || pid == knownMinerPid) continue;
+
+			    string pidName = null;
+			    try
+			    {
+			        using var pProbe = Process.GetProcessById(pid);
+			        pidName = pProbe.ProcessName;
+			    }
+			    catch { continue; } // processo já morreu
+
+			    if (SaladRootProcessNames.Contains(pidName)) continue;
+
+			    if (IsUnderSaladTreeCached(pid)) continue;
+
+			    string behavior = ClassifyProcessGpuBehavior(pid, gpuUsageMap);
+
+                        if (behavior == "SUSPECTED_MINER")
+                        {
+                            string procName = "unknown";
+                            try
+                            {
+                                using var p = Process.GetProcessById(pid);
+                                procName = p.ProcessName;
+                            }
+                            catch { continue; } // processo já morreu, ignora
+
+                            minerStatus = $"[darkorange][[ SUSPECTED MINER - {procName.ToUpper()} (EXTERNAL) ]][/]";
+                            minerFound = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (!minerFound)
+                {
+                    minerStatus = "[grey]Idle[/]";
+
+                    // Limpa caches periodicamente (evita crescimento infinito)
+			if ((DateTime.Now - lastMinerCacheClear).TotalMinutes > 10)
+			{
+			    minerScopeCache.Clear();
+			    saladTreeCache.Clear();
+			    lastMinerCacheClear = DateTime.Now;
+			}
+                }
             }
             catch
             {
@@ -886,21 +1336,26 @@ static double GetAmdGpuUtilization()
                         var parts = output.Split(',');
                         if (parts.Length >= 4)
                         {
-                             string smiName = parts[0].Trim().Replace("NVIDIA GeForce ", "").Replace("NVIDIA ", "");
-                             txtGpu = $"{smiName} (Load: {parts[1].Trim()}% | Pwr: {parts[2].Trim()}W | Temp: {parts[3].Trim()}�C)";
+                            string smiName = parts[0].Trim().Replace("NVIDIA GeForce ", "").Replace("NVIDIA ", "");
+                            txtGpu = $"{smiName} (Load: {parts[1].Trim()}% | Pwr: {parts[2].Trim()}W | Temp: {parts[3].Trim()}\u00B0C)";
+
+                            if (double.TryParse(parts[1].Trim(), System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out double gpuLoad))
+                                currentGpuLoadPct = gpuLoad;
                         }
                     }
                 }
             }
-catch
-{
-    string fallbackGpu = GetMiningGpuName() ?? "Unknown GPU";
-    double amdLoad = GetAmdGpuUtilization();
+            catch
+            {
+                string fallbackGpu = GetMiningGpuName() ?? "Unknown GPU";
+                double amdLoad = GetAmdGpuUtilization();
 
-    txtGpu = amdLoad >= 0
-        ? $"{fallbackGpu} (Load: {amdLoad}%)"
-        : $"{fallbackGpu} (SMI Sensores N/A)";
-}
+                txtGpu = amdLoad >= 0
+                    ? $"{fallbackGpu} (Load: {amdLoad}%)"
+                    : $"{fallbackGpu} (SMI Sensores N/A)";
+
+                currentGpuLoadPct = amdLoad >= 0 ? amdLoad : 0;
+            }
             LoadDiskInfo();
             try
             {
@@ -918,14 +1373,14 @@ catch
                         string readStr = readB >= 1048576 ? $"{(readB / 1048576):F1} MB/s" : $"{(readB / 1024):F1} KB/s";
                         string writeStr = writeB >= 1048576 ? $"{(writeB / 1048576):F1} MB/s" : $"{(writeB / 1024):F1} KB/s";
 
-                        txtDisk = $"{hostDiskName} (Load: {util:F0}% | R: {readStr} | W: {writeStr})";
+			txtDisk = $"{hostDiskName} {GetDiskFreeSpaceStr()} (Load: {util:F0}% | R: {readStr} W: {writeStr})";
                         break;
                     }
                 }
             }
             catch
             {
-                txtDisk = $"{hostDiskName} (I/O Data N/A)";
+			txtDisk = $"{hostDiskName} | {GetDiskFreeSpaceStr()} (I/O Data N/A)";
             }
         }
 
@@ -933,9 +1388,19 @@ catch
         {
             try
             {
-                long ramTotalBytes = Process.GetProcesses().Where(p => p.ProcessName == "vmmemWSL" || p.ProcessName == "vmmem" || p.ProcessName == "wslhost").Sum(p => p.WorkingSet64);
-                wslRamMB = ramTotalBytes / 1048576.0;
-                ramUsage = wslRamMB > 0 ? $"{wslRamMB:N1} MB" : "Awaiting WSL...";
+		var wslProcs = Process.GetProcesses();
+		try
+		{
+		    long ramTotalBytes = wslProcs
+		        .Where(p => p.ProcessName == "vmmemWSL" || p.ProcessName == "vmmem" || p.ProcessName == "wslhost")
+		        .Sum(p => p.WorkingSet64);
+		    wslRamMB = ramTotalBytes / 1048576.0;
+		    ramUsage = wslRamMB > 0 ? $"{wslRamMB:N1} MB" : "Awaiting WSL...";
+		}
+		finally
+		{
+		    foreach (var p in wslProcs) p.Dispose();
+		}
 
                 ProcessStartInfo psi = new ProcessStartInfo { FileName = "wsl.exe", Arguments = "-l -v", RedirectStandardOutput = true, UseShellExecute = false, CreateNoWindow = true, StandardOutputEncoding = System.Text.Encoding.Unicode };
                 using (Process proc = Process.Start(psi))
@@ -986,12 +1451,12 @@ catch
                 helpGrid.AddRow(new Align(logoTable, HorizontalAlignment.Center));
                 helpGrid.AddRow(new Text(""));
 
-var helpText = new Markup(
-    "[green bold]Controls & Shortcuts:[/]\n\n" +
-    "[yellow][[CTRL]] [[+ / -]][/] : Zoom in/out on the terminal (Windows default).\n" +
-    "[yellow][[H]][/]            : Toggle between the Dashboard and this Help screen.\n" +
-    "[yellow][[ESC]][/]          : Safely exit SaladXRay."
-);
+                var helpText = new Markup(
+                    "[green bold]Controls & Shortcuts:[/]\n\n" +
+                    "[yellow][[CTRL]] [[+ / -]][/] : Zoom in/out on the terminal (Windows default).\n" +
+                    "[yellow][[H]][/]            : Toggle between the Dashboard and this Help screen.\n" +
+                    "[yellow][[ESC]][/]          : Safely exit SaladXRay."
+                );
 
                 var helpPanel = new Panel(helpText)
                     .Header("[white bold] HELP & CONTROLS [/]", Justify.Left)
@@ -1000,32 +1465,32 @@ var helpText = new Markup(
 
                 helpGrid.AddRow(helpPanel);
 
-var aboutText = new Markup(
-    "[bold cyan]Born from Agony, Built for Peace of Mind[/]\n\n" +
-    "[green]SaladXRay[/] exists because of pure agony. Watching a container download " +
-    "with no idea when it would finish, no transfer rate, no job size, no ETA - just " +
-    "refreshing the raw logs like a maniac, hoping for a clue. That anxiety is gone now.\n\n" +
-    "This tool was built to answer the questions Salad itself doesn't show you: " +
-    "[yellow]how much is downloaded, how fast, and how long until it's done[/]. " +
-    "Real-time visibility into your hardware, your WSL virtual machine, your container " +
-    "workload, your wallet, and real-time network demand fetched directly from Salad's public API " +
-    "- all in one glance.\n\n" +
-    "[bold cyan][[-h]] Human-Readable Translation:[/] For your absolute peace of mind, SaladXRay is " +
-    "strictly a read-only tool. No spooky background commands, no system tweaks. It safely builds " +
-    "this dashboard by simply parsing the Salad log file, tapping into standard Windows APIs, and " +
-    "reading public data. Just like a real X-Ray, it only observes.\n\n" +
-    "True story: before development even started, I picked up a container, watched the download " +
-    "crawl through Task Manager, and right in the middle of it... the power went out. I never " +
-    "knew how much had downloaded, or how much was left. SaladXRay was born out of exactly " +
-    "that kind of moment.\n\n" +
-    "Built in about 15 days total - 5 of them after the first beta - for anyone running " +
-    "Salad who's ever wanted to actually [bold]understand[/] what's happening under the hood, " +
-    "instead of just hoping for the best.\n\n" +
-    "[bold]The hardest bug I ever fixed?[/] My wife. Everything else - WSL quirks, log parsing, " +
-    "GPU demand APIs - was easy compared to that. [grey](Love you, babe.)[/]\n\n" +
-    $"[grey]XRay Version:[/] {xrayVersion}\n" +
-    "[grey]Built with patience (and a very understanding wife) for the community.[/]"
-);
+                var aboutText = new Markup(
+                    "[bold cyan]Born from Agony, Built for Peace of Mind[/]\n\n" +
+                    "[green]SaladXRay[/] exists because of pure agony. Watching a container download " +
+                    "with no idea when it would finish, no transfer rate, no job size, no ETA - just " +
+                    "refreshing the raw logs like a maniac, hoping for a clue. That anxiety is gone now.\n\n" +
+                    "This tool was built to answer the questions Salad itself doesn't show you: " +
+                    "[yellow]how much is downloaded, how fast, and how long until it's done[/]. " +
+                    "Real-time visibility into your hardware, your WSL virtual machine, your container " +
+                    "workload, your wallet, and real-time network demand fetched directly from Salad's public API " +
+                    "- all in one glance.\n\n" +
+                    "[bold cyan][[-h]] Human-Readable Translation:[/] For your absolute peace of mind, SaladXRay is " +
+                    "strictly a read-only tool. No spooky background commands, no system tweaks. It safely builds " +
+                    "this dashboard by simply parsing the Salad log file, tapping into standard Windows APIs, and " +
+                    "reading public data. Just like a real X-Ray, it only observes.\n\n" +
+                    "True story: before development even started, I picked up a container, watched the download " +
+                    "crawl through Task Manager, and right in the middle of it... the power went out. I never " +
+                    "knew how much had downloaded, or how much was left. SaladXRay was born out of exactly " +
+                    "that kind of moment.\n\n" +
+                    "Built in about 15 days total - 5 of them after the first beta - for anyone running " +
+                    "Salad who's ever wanted to actually [bold]understand[/] what's happening under the hood, " +
+                    "instead of just hoping for the best.\n\n" +
+                    "[bold]The hardest bug I ever fixed?[/] My wife. Everything else - WSL quirks, log parsing, " +
+                    "GPU demand APIs - was easy compared to that. [grey](Love you, babe.)[/]\n\n" +
+                    $"[grey]XRay Version:[/] {xrayVersion}\n" +
+                    "[grey]Built with patience (and a very understanding wife) for the community.[/]"
+                );
                 var aboutPanel = new Panel(aboutText)
                     .Header("[white bold] ABOUT SALAD XRAY [/]", Justify.Left)
                     .BorderColor(Color.Blue)
@@ -1045,17 +1510,21 @@ var aboutText = new Markup(
             var grid = new Grid().Expand();
             grid.AddColumn(new GridColumn());
 
-            string fileName = Path.GetFileName(filePath);
+	    string fileName = Path.GetFileName(filePath) ?? "No log file found";
 
+            // AQUI FOI ONDE A MÁGICA ACONTECEU COM O SEU HELPER
             TimeSpan appUptime = DateTime.Now - appStartTime;
-            string formattedAppUptime = $"{(int)appUptime.TotalHours:D2}:{appUptime.Minutes:D2}:{appUptime.Seconds:D2}";
+            string formattedAppUptime = FormatUptime(appUptime);
+
+            TimeSpan osUptime = TimeSpan.FromMilliseconds(Environment.TickCount64);
+	    string formattedOsUptime = FormatUptime(osUptime);
 
             string formattedSaladUptime = saladStartTime != DateTime.MinValue
-                ? $"{(int)(DateTime.Now - saladStartTime).TotalHours:D2}:{(DateTime.Now - saladStartTime).Minutes:D2}:{(DateTime.Now - saladStartTime).Seconds:D2}"
+                ? FormatUptime(DateTime.Now - saladStartTime)
                 : "Offline";
 
             string formattedBowlUptime = saladBowlStartTime != DateTime.MinValue
-                ? $"{(int)(DateTime.Now - saladBowlStartTime).TotalHours:D2}:{(DateTime.Now - saladBowlStartTime).Minutes:D2}:{(DateTime.Now - saladBowlStartTime).Seconds:D2}"
+                ? FormatUptime(DateTime.Now - saladBowlStartTime)
                 : "Offline";
 
             string uiStr = saladVersion == "Unknown" || saladVersion == "Detecting..." ? uiName : $"{uiName} v{saladVersion}";
@@ -1063,17 +1532,19 @@ var aboutText = new Markup(
 
             string titleText = $"[yellow bold]{xrayName} v{xrayVersion} [[ESC]] Exit [[H]] Help/About[/]";
 
-            var infoPanel = CreateBannerPanel(titleText, new Dictionary<string, string> {
-                { "APP VERSION", $"[green]{Markup.Escape(uiStr)}[/]" },
-                { "SVC VERSION", $"[blue]{Markup.Escape(svcStr)}[/]" },
-                { "READING LOG", $"[cyan]{Markup.Escape(fileName)}[/]" }
-            });
+		var infoPanel = CreateBannerPanel(titleText, new Dictionary<string, string> {
+		    { "APP VERSION", $"[green]{Markup.Escape(uiStr)}[/]" },
+		    { "SVC VERSION", $"[blue]{Markup.Escape(svcStr)}[/]" },
+		    { "OS VERSION", $"[magenta]{Markup.Escape(osDisplayName)}[/]" },
+		    { "READING LOG", $"[cyan]{Markup.Escape(fileName)}[/]" }
+		});
 
             // 1. CONTENT (Internal table, super clean)
             var uptimeContent = new Table().HideHeaders().Border(TableBorder.None);
             uptimeContent.AddColumn(new TableColumn("").NoWrap());
             uptimeContent.AddRow(new Markup($"[green]App:[/] {formattedSaladUptime}"));
             uptimeContent.AddRow(new Markup($"[blue]Svc:[/] {formattedBowlUptime}"));
+            uptimeContent.AddRow(new Markup($"[magenta]OS :[/] {formattedOsUptime}"));
             uptimeContent.AddRow(new Markup($"[yellow bold]Xry:[/] {formattedAppUptime}"));
 
             string uptimeTitle = "[yellow bold]Uptime[/]";
@@ -1087,14 +1558,14 @@ var aboutText = new Markup(
             // 3. Safe right alignment
             var rightAlignedUptime = new Align(uptimePanel, HorizontalAlignment.Right);
 
-// 4. TOP GRID
-var topHeaderGrid = new Grid();
-topHeaderGrid.AddColumn(new GridColumn());
-topHeaderGrid.AddColumn(new GridColumn().Width(UPTIME_PANEL_WIDTH));
-topHeaderGrid.AddRow(infoPanel, new Align(uptimePanel, HorizontalAlignment.Right));
-topHeaderGrid.Expand();
+            // 4. TOP GRID
+            var topHeaderGrid = new Grid();
+            topHeaderGrid.AddColumn(new GridColumn());
+            topHeaderGrid.AddColumn(new GridColumn().Width(UPTIME_PANEL_WIDTH));
+            topHeaderGrid.AddRow(infoPanel, new Align(uptimePanel, HorizontalAlignment.Right));
+            topHeaderGrid.Expand();
 
-grid.AddRow(topHeaderGrid); // without wrapping Panel
+            grid.AddRow(topHeaderGrid); // without wrapping Panel
 
             // =============================================
 
@@ -1145,7 +1616,24 @@ grid.AddRow(topHeaderGrid); // without wrapping Panel
             var logsArray = recentLogs.ToArray();
             var errorTable = new Table().HideHeaders().Border(TableBorder.None).Expand();
             errorTable.AddColumn(new TableColumn("Label").Width(15).NoWrap()); errorTable.AddColumn(new TableColumn("Value").NoWrap());
-            errorTable.AddRow(new Markup("[white]:warning: Last Error[/]"), new Markup($"[white]:[/] {TruncateWithColors($"[red]{Markup.Escape(lastWarning)}[/]", Math.Max(10, AnsiConsole.Profile.Width - 25))}"));
+		string errColor = lastErrorLevel switch
+		{
+		    "ERR" => "red",
+		    "WRN" => "yellow",
+		    _ => "grey"
+		};
+
+		string levelLabel = lastErrorLevel switch
+		{
+		    "ERR" => "Error",
+		    "WRN" => "Warning",
+		    _ => "Error"
+		};
+
+		errorTable.AddRow(
+		    new Markup($"[{errColor}]:warning: Last {levelLabel}[/]"),
+		    new Markup($"[white]:[/] {TruncateWithColors($"[{errColor}]{Markup.Escape(lastWarning)}[/]", Math.Max(10, AnsiConsole.Profile.Width - 25))}")
+		);
 
             int logMaxWidth = Math.Max(20, AnsiConsole.Profile.Width - 8);
             var logsBlock = new Markup($"  {TruncateWithColors(logsArray.Length > 0 ? logsArray[0] : "", logMaxWidth)}\n  {TruncateWithColors(logsArray.Length > 1 ? logsArray[1] : "", logMaxWidth)}\n  {TruncateWithColors(logsArray.Length > 2 ? logsArray[2] : "", logMaxWidth)}\n  {TruncateWithColors(logsArray.Length > 3 ? logsArray[3] : "", logMaxWidth)}");
@@ -1172,83 +1660,127 @@ grid.AddRow(topHeaderGrid); // without wrapping Panel
             return result.ToString();
         }
 
+	// adapt icons w10
+	static string AdaptIcon(string label)
+	{
+	    if (!isLegacyEmojiMode || string.IsNullOrEmpty(label)) return label;
+
+	    if (_adaptIconCache.TryGetValue(label, out var cached))
+	        return cached;
+
+	    string result = EmojiShortcodeRegex.Replace(label, "-").TrimStart();
+	    _adaptIconCache[label] = result;
+	    return result;
+	}
+
         static Panel CreateSection(string title, Dictionary<string, string> items)
         {
             var table = new Table().HideHeaders().Border(TableBorder.None).Expand();
             table.AddColumn(new TableColumn("Label").Width(15).NoWrap()); table.AddColumn(new TableColumn("Value").NoWrap());
-            foreach (var item in items) table.AddRow(new Markup($"[white]{Markup.Escape(item.Key ?? "")}[/]"), new Markup($"[white]:[/] {TruncateWithColors(item.Value ?? "", Math.Max(10, AnsiConsole.Profile.Width - 25))}"));
+	    foreach (var item in items) table.AddRow(new Markup($"[white]{Markup.Escape(AdaptIcon(item.Key ?? ""))}[/]"), new Markup($"[white]:[/] {TruncateWithColors(item.Value ?? "", Math.Max(10, AnsiConsole.Profile.Width - 25))}"));
             return new Panel(table).Header($"[cyan][[ {Markup.Escape(title)} ]][/]").BorderColor(Color.Cyan).Expand();
         }
 
-static Panel CreateBannerPanel(string title, Dictionary<string, string> items)
-{
-    int panelWidth = Math.Max(20, AnsiConsole.Profile.Width - (UPTIME_PANEL_WIDTH + 5));
-    int labelWidth = 15;
-
-    var lines = new List<Markup>();
-
-    foreach (var item in items)
-    {
-        string key = (item.Key ?? "").Length > labelWidth
-            ? (item.Key ?? "").Substring(0, labelWidth)
-            : (item.Key ?? "").PadRight(labelWidth);
-
-        string safeKey = Markup.Escape(key);
-        string rawLine = $"[white]{safeKey}[/] [white]:[/] {item.Value ?? ""}";
-
-        // truncates the COMPLETE LINE already assembled, ensuring it never exceeds the panel
-        string finalLine = TruncateWithColors(rawLine, panelWidth - 4); // -4 = panel borders/padding
-
-        lines.Add(new Markup(finalLine));
-    }
-
-    var rows = new Rows(lines);
-
-    return new Panel(rows)
-        .Header(TruncateWithColors(title, Math.Max(15, AnsiConsole.Profile.Width - (UPTIME_PANEL_WIDTH + 7))))
-        .BorderColor(Color.White)
-        .SquareBorder();
-}
-
-        static string GetMiningGpuName()
+        static Panel CreateBannerPanel(string title, Dictionary<string, string> items)
         {
-            string nomeFinal = null;
-            try
+            int panelWidth = Math.Max(20, AnsiConsole.Profile.Width - (UPTIME_PANEL_WIDTH + 5));
+            int labelWidth = 15;
+
+            var lines = new List<Markup>();
+
+            foreach (var item in items)
             {
-                using (var searcher = new ManagementObjectSearcher("SELECT Name FROM Win32_VideoController"))
-                {
-                    foreach (ManagementObject obj in searcher.Get())
-                    {
-                        string gpuName = obj["Name"]?.ToString();
-                        if (string.IsNullOrEmpty(gpuName)) continue;
+                string key = (item.Key ?? "").Length > labelWidth
+                    ? (item.Key ?? "").Substring(0, labelWidth)
+                    : (item.Key ?? "").PadRight(labelWidth);
 
-                        if (gpuName.IndexOf("Intel", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                            gpuName.IndexOf("Microsoft", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                            gpuName.IndexOf("VMware", StringComparison.OrdinalIgnoreCase) >= 0)
-                        {
-                            continue;
-                        }
+                string safeKey = Markup.Escape(key);
+                string rawLine = $"[white]{safeKey}[/] [white]:[/] {item.Value ?? ""}";
 
-                        if (gpuName.IndexOf("AMD", StringComparison.OrdinalIgnoreCase) >= 0)
-                        {
-                            nomeFinal = gpuName.Replace("Radeon ", "").Replace("radeon ", "").Trim();
-                            break;
-                        }
+                // truncates the COMPLETE LINE already assembled, ensuring it never exceeds the panel
+                string finalLine = TruncateWithColors(rawLine, panelWidth - 4); // -4 = panel borders/padding
 
-                        if (gpuName.IndexOf("NVIDIA", StringComparison.OrdinalIgnoreCase) >= 0)
-                        {
-                            nomeFinal = gpuName.Replace("GeForce ", "").Replace("geforce ", "").Trim();
-                            break;
-                        }
-
-                        nomeFinal = gpuName;
-                        break;
-                    }
-                }
+                lines.Add(new Markup(finalLine));
             }
-            catch { }
-            return nomeFinal;
+
+            var rows = new Rows(lines);
+
+            return new Panel(rows)
+                .Header(TruncateWithColors(title, Math.Max(15, AnsiConsole.Profile.Width - (UPTIME_PANEL_WIDTH + 7))))
+                .BorderColor(Color.White)
+                .SquareBorder();
         }
+
+        // Padrões de iGPU AMD integrada (APU) que devem perder pra qualquer GPU discreta
+        private static readonly string[] AmdIntegratedPatterns = {
+            "Radeon(TM) Graphics",
+            "Radeon Graphics",
+            "Radeon(TM) Vega",
+            "Radeon Vega",
+            "Radeon(TM) HD Graphics",
+            "Radeon HD Graphics"
+        };
+
+        static bool IsAmdIntegrated(string gpuName)
+        {
+            foreach (var pattern in AmdIntegratedPatterns)
+            {
+                if (gpuName.IndexOf(pattern, StringComparison.OrdinalIgnoreCase) >= 0)
+                    return true;
+            }
+            return false;
+        }
+
+	static string GetMiningGpuName()
+	{
+	    try
+	    {
+	        var candidates = new List<string>();
+
+	        using (var searcher = new ManagementObjectSearcher("SELECT Name FROM Win32_VideoController"))
+	        {
+	            foreach (ManagementObject obj in searcher.Get())
+	            {
+	                string gpuName = obj["Name"]?.ToString();
+	                if (string.IsNullOrEmpty(gpuName)) continue;
+
+	                bool isAmd = gpuName.IndexOf("AMD", StringComparison.OrdinalIgnoreCase) >= 0
+	                          || gpuName.IndexOf("Radeon", StringComparison.OrdinalIgnoreCase) >= 0;
+	                bool isNvidia = gpuName.IndexOf("NVIDIA", StringComparison.OrdinalIgnoreCase) >= 0
+	                             || gpuName.IndexOf("GeForce", StringComparison.OrdinalIgnoreCase) >= 0;
+
+	                // Whitelist:eonly AMD and NVIDIA 
+	                if (!isAmd && !isNvidia) continue;
+
+	                candidates.Add(gpuName);
+	            }
+	        }
+
+	        if (candidates.Count == 0) return null;
+
+	        foreach (var gpuName in candidates)
+	        {
+	            bool isAmd = gpuName.IndexOf("AMD", StringComparison.OrdinalIgnoreCase) >= 0;
+	            bool isNvidia = gpuName.IndexOf("NVIDIA", StringComparison.OrdinalIgnoreCase) >= 0;
+
+	            if (isAmd && !IsAmdIntegrated(gpuName))
+	                return gpuName.Replace("Radeon ", "").Replace("radeon ", "").Trim();
+
+	            if (isNvidia)
+	                return gpuName.Replace("GeForce ", "").Replace("geforce ", "").Trim();
+	        }
+
+	        foreach (var gpuName in candidates)
+	        {
+	            if (gpuName.IndexOf("AMD", StringComparison.OrdinalIgnoreCase) >= 0)
+	                return gpuName.Replace("Radeon ", "").Replace("radeon ", "").Trim();
+	        }
+
+	        return candidates[0];
+	    }
+	    catch { }
+	    return null;
+	}
 
         static string FormatVersionWithShortHash(string fullVersion)
         {
@@ -1263,6 +1795,16 @@ static Panel CreateBannerPanel(string title, Dictionary<string, string> items)
             }
 
             return parts[0];
+        }
+
+        // ==========================================
+        // O SEU HELPER ADICIONADO AQUI
+        // ==========================================
+        static string FormatUptime(TimeSpan ts)
+        {
+            if (ts.TotalDays >= 1)
+                return $"{(int)ts.TotalDays}d {ts.Hours:D2}:{ts.Minutes:D2}:{ts.Seconds:D2}";
+            return $"{ts.Hours:D2}:{ts.Minutes:D2}:{ts.Seconds:D2}";
         }
     }
 
@@ -1285,6 +1827,9 @@ static Panel CreateBannerPanel(string title, Dictionary<string, string> items)
 
         [JsonPropertyName("recommendedSpecs")]
         public RecommendedSpecsData RecommendedSpecs { get; set; }
+
+        [JsonPropertyName("variantNames")]
+        public List<string> VariantNames { get; set; }
     }
 
     public class EarningRatesData
@@ -1302,4 +1847,3 @@ static Panel CreateBannerPanel(string title, Dictionary<string, string> items)
         public int RamGb { get; set; }
     }
 }
-
