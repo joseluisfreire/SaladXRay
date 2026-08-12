@@ -8,6 +8,11 @@
   <strong>Simple X-Ray glasses for your Salad node. Just to see what's happening under the hood!</strong>
 </p>
 
+<p align="center">
+  <img src="https://img.shields.io/github/downloads/joseluisfreire/saladxray/total" alt="Downloads" />
+  <img src="https://img.shields.io/github/v/release/joseluisfreire/saladxray" alt="Latest Release" />
+</p>
+
 ## 🛠️ How to Build / Compiling from Source
 
 If you want to compile Salad XRay from the source code, you'll need the [.NET 8.0 SDK](https://dotnet.microsoft.com/en-us/download) (or newer) installed on your machine.
