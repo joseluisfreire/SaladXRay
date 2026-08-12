@@ -9,8 +9,12 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/github/downloads/joseluisfreire/saladxray/total" alt="Downloads" />
-  <img src="https://img.shields.io/github/v/release/joseluisfreire/saladxray" alt="Latest Release" />
+  <a href="https://github.com/joseluisfreire/saladxray/releases">
+    <img src="https://img.shields.io/github/downloads/joseluisfreire/saladxray/total" alt="Downloads" />
+  </a>
+  <a href="https://github.com/joseluisfreire/saladxray/releases/latest">
+    <img src="https://img.shields.io/github/v/release/joseluisfreire/saladxray" alt="Latest Release" />
+  </a>
 </p>
 
 ## 🛠️ How to Build / Compiling from Source
