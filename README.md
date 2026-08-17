@@ -37,6 +37,7 @@ cd SaladXRay
 ```powershell
 dotnet add package Spectre.Console
 dotnet add package System.Management
+dotnet add package System.Diagnostics.PerformanceCounter
 ```
 This project relies on a couple of NuGet packages for the UI and system hardware readings:
 (if default command fails, just add this --source https://api.nuget.org/v3/index.json)
@@ -44,6 +45,7 @@ This project relies on a couple of NuGet packages for the UI and system hardware
 ```powershell
 dotnet add package Spectre.Console --source https://api.nuget.org/v3/index.json
 dotnet add package System.Management --source https://api.nuget.org/v3/index.json
+dotnet add package System.Diagnostics.PerformanceCounter --source https://api.nuget.org/v3/index.json
 ```
 ### 3. Build as a Standalone Executable (Recommended)
 
