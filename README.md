@@ -34,13 +34,17 @@ cd SaladXRay
 
 ### 2. Install Required Dependencies
 
-This project relies on a couple of NuGet packages for the UI and system hardware readings:
-
 ```powershell
 dotnet add package Spectre.Console
 dotnet add package System.Management
 ```
+This project relies on a couple of NuGet packages for the UI and system hardware readings:
+(if default command fails, just add this --source https://api.nuget.org/v3/index.json)
 
+```powershell
+dotnet add package Spectre.Console --source https://api.nuget.org/v3/index.json
+dotnet add package System.Management --source https://api.nuget.org/v3/index.json
+```
 ### 3. Build as a Standalone Executable (Recommended)
 
 To make it easy to run without requiring users to install the .NET runtime, publish it as a single, self-contained executable for Windows x64:
