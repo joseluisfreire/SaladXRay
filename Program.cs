@@ -32,20 +32,28 @@ namespace SaladXRayPanel
         static List<PerformanceCounter> amdGpuCounters = null;
         static bool amdCountersInitFailed = false;
         static double currentGpuLoadPct = 0;
+		static bool nvidiaSmiFailed = false;
 
-	// New Heuristic Miner Detection (engine-type based)
-	static Dictionary<string, PerformanceCounter> gpuEngineCounters = new();
-	static PerformanceCounterCategory gpuEngineCategory;
-	static DateTime lastGpuEngineRefresh = DateTime.MinValue;
-	static bool gpuEngineCountersInitFailed = false;
-	static readonly Dictionary<int, string> minerScopeCache = new();
-	static readonly Dictionary<int, (bool result, DateTime cachedAt)> saladTreeCache = new();
-	static readonly TimeSpan SaladTreeCacheTtl = TimeSpan.FromMinutes(2);
+		static DateTime wslStartTime = DateTime.MinValue;
 
-	static DateTime lastMinerCacheClear = DateTime.MinValue;
-
+		static bool showSupportTab = false; // toggle [S] entre About e Suporte
         static bool showHelpScreen = false; // Help/About screen control
         static FigletFont embeddedFont = null;
+
+		// SGS - portado 1:1 do EnvironmentService.cs
+		static DateTime sgsStartTime = DateTime.MinValue;
+		static string sgsStatus = "Offline";
+		static double sgsCpuUsagePct = 0;
+		static double sgsRamMB2 = 0; // MB via WorkingSetPrivate (WMI), não confundir com sgsTotalRxMB/Tx existentes
+		static string sgsNetworkSpeed = "0 bps";
+
+		static readonly Dictionary<string, (ulong PercentProcessorTime, ulong TimestampSys100NS)> _sgsCpuHistory = new();
+		static PerformanceCounter _sgsNetCounter = null;
+		static int _sgsNetCounterPid = -1;
+
+		static string _categoryName = null;
+		static string _counterName = null;
+		static string _idCounterName = null;
 
         // Fixed width for the Uptime panel (synchronized with the banner calculation)
         const int UPTIME_PANEL_WIDTH = 23;
@@ -55,16 +63,40 @@ namespace SaladXRayPanel
         static string jobId = "Pending...", containerStatus = "Pending...", workTime = "Computing...";
         static string txtCpu = "Computing...", txtGpu = "Computing...", txtRam = "Computing...";
         static string txtDisk = "Computing...";
-        static string minerStatus = "[grey]Idle[/]", bandwidthStatus = "[grey]Idle[/]";
-        static string lastWarning = "No recent errors detected in the current session.";
-        static string lastErrorLevel = "";
-
+		static readonly Queue<(DateTime Timestamp, string Message)> errorHistory = new();
+		const int MaxErrorHistory = 5;
+		static bool showErrorHistory = false; // toggle [E]
+		static DateTime lastErrorClearTime = DateTime.Now; // referência "sem incidentes há..."
+		
 	//windows detect
 	static string osDisplayName = "Detecting...";
 	static bool isLegacyEmojiMode = false;
 	private static readonly Regex EmojiShortcodeRegex = new(@":[a-z0-9_]+:");
-	private static readonly Dictionary<string, string> _adaptIconCache = new();
-	
+	// Fallback Unicode para emojis do Spectre em terminais legados (Windows 10)
+	private static readonly Dictionary<string, string> _adaptIconCache = new(StringComparer.OrdinalIgnoreCase);
+	private static readonly Dictionary<string, string> EmojiFallbackMap = new(StringComparer.OrdinalIgnoreCase)
+	{
+		{ ":money_bag:", "💰" },
+		{ ":desktop_computer:", "🖥" },
+		{ ":stopwatch:", "⏱" },
+		{ ":floppy_disk:", "💾" },
+		{ ":optical_disk:", "💿" },
+		{ ":satellite_antenna:", "📡" },
+		{ ":satellite:", "🛰" },
+		{ ":id_button:", "🆔" },
+		{ ":package:", "📦" },
+		{ ":gear:", "⚙" },
+		{ ":fire:", "🔥" },
+		{ ":bar_chart:", "📊" },
+		{ ":gem_stone:", "💎" },
+		{ ":chart_increasing:", "📈" },
+		{ ":globe_with_meridians:", "🌐" },
+		{ ":pick:", "⛏️" },
+		{ ":warning:", "⚠" },
+		{ ":broken_heart:", "💔" },
+		{ ":red_heart:", "❤" },
+		{ ":beating_heart:", "💓" },
+	};	
         // Human-readable Matrix status (Salad Backend)
         static string matrixStatus = "[grey]Waiting for matrix data...[/]";
 
@@ -76,6 +108,15 @@ namespace SaladXRayPanel
         static DateTime lastGpuDemandUpdate = DateTime.MinValue;
         static bool isFetchingDemand = false;
         static readonly HttpClient httpClient = CreateHttpClient();
+
+        // Novatech (nova fonte de dados)
+        static string novaTier = null;
+        static double? novaUtil = null;
+        static double? novaMinEarning = null;
+        static double? novaMaxEarning = null;
+        static string novaMatchStatus = "[grey]Waiting...[/]";
+        static bool isNovaOnline = false;
+        static bool useNovaDemandView = false; // toggle [N]
 
         static readonly string SaladLogDirectory = ResolveSaladLogDirectory();
 
@@ -166,102 +207,178 @@ namespace SaladXRayPanel
         static DateTime lastVNetTime = DateTime.MinValue;
         static double vNetTotalRxGB = 0, vNetTotalTxGB = 0;
 
-        static long lastSgsRx = 0, lastSgsTx = 0;
-        static DateTime lastSgsTime = DateTime.MinValue;
-        static double sgsTotalRxMB = 0, sgsTotalTxMB = 0;
-        static string sgsDetails = "[grey]Computing traffic...[/]";
-        static string sgsTotalTraffic = "0 MB (IN) | 0 MB (OUT)";
-        static string sgsNodeName = "Waiting for node...";
+		static string workloadHardwareType = "[grey]N/A[/]";
+		static string computeWorkloadType = null;
+		static bool isBandwidthActive = false;
 
         static DateTime lastWalletUpdate = DateTime.MinValue;
         static DateTime jobStartTime = DateTime.MinValue;
         static DateTime lastLogHeartbeat = DateTime.MinValue;
-        static Queue<string> recentLogs = new Queue<string>(new[] { "Awaiting logs...", "", "", "" });
-        static long lastLogPosition = 0;
+		class LogItem
+		{
+			public string FormattedText;
+			public DateTime Timestamp;
+			public bool IsError;
+		}
 
-        static async Task Main(string[] args)
-        {
-            Console.OutputEncoding = System.Text.Encoding.UTF8;
-            Console.CursorVisible = false;
+		static List<LogItem> recentLogs = new List<LogItem>
+		{
+			new LogItem { FormattedText = "[grey]Awaiting logs...[/]", Timestamp = DateTime.Now, IsError = false }
+		};
+		static long lastLogPosition = 0;
+		
+		static int lastKnownWidth = -1;
+		static int lastKnownHeight = -1;
 
-            // ==========================================
-            // LOAD CUSTOM FONT
-            // ==========================================
-            try
-            {
-                var assembly = System.Reflection.Assembly.GetExecutingAssembly();
-                using (var stream = assembly.GetManifestResourceStream("SaladXRayPanel.smslant.flf"))
-                {
-                    if (stream != null) embeddedFont = FigletFont.Load(stream);
-                }
-            }
-            catch { /* IF ERROR */ }
-            // ==========================================
+		static bool DetectConsoleResize()
+		{
+			int w = Console.WindowWidth;
+			int h = Console.WindowHeight;
 
-            string logsFolder = SaladLogDirectory + Path.DirectorySeparatorChar;
+			if (lastKnownWidth == -1) { lastKnownWidth = w; lastKnownHeight = h; return false; }
 
-            RestoreInitialState(logsFolder);
-            UpdateSaladInfo();
-            DetectWindowsVersion();
-
-            string logFile = GetMostRecentLogFile(logsFolder);
-            if (logFile == null) logFile = $"log-{DateTime.Now:yyyyMMdd}.txt (Not Found)";
-
-            await AnsiConsole.Live(RenderPanel(logFile))
-                .Cropping(VerticalOverflowCropping.Bottom)
-                .StartAsync(async ctx =>
-                {
-                    int loopCounter = 0;
-                    while (true)
-                    {
-			string foundLog = GetMostRecentLogFile(logsFolder);
-			if (foundLog != null)
+			if (w != lastKnownWidth || h != lastKnownHeight)
 			{
-			    logFile = foundLog;
-			    ReadSaladLogs(logFile);
+				lastKnownWidth = w;
+				lastKnownHeight = h;
+				return true;
 			}
+			return false;
+		}
 
-                        if (loopCounter % 2 == 0)
-                        {
-                            UpdateNetwork();
-                            UpdateSaladInfo();
-                            _ = FetchGpuDemandDataAsync();
-                        }
+		static async Task Main(string[] args)
+		{
+			Console.OutputEncoding = System.Text.Encoding.UTF8;
+			Console.CursorVisible = false;
 
-                        if (loopCounter % 10 == 0)
-                        {
-                            UpdateHostHardware();
-                            UpdateWSLData();
-                        }
+			// ==========================================
+			// LOAD CUSTOM FONT
+			// ==========================================
+			try
+			{
+				var assembly = System.Reflection.Assembly.GetExecutingAssembly();
+				using (var stream = assembly.GetManifestResourceStream("SaladXRayPanel.smslant.flf"))
+				{
+					if (stream != null) embeddedFont = FigletFont.Load(stream);
+				}
+			}
+			catch { /* IF ERROR */ }
+			// ==========================================
 
-                        CalculateUptime();
-                        ctx.UpdateTarget(RenderPanel(logFile));
+			string logsFolder = SaladLogDirectory + Path.DirectorySeparatorChar;
 
-                        loopCounter++;
+			RestoreInitialState(logsFolder);
+			UpdateSaladInfo();
+			DetectWindowsVersion();
 
-                        // Check keyboard input
-                        for (int i = 0; i < 10; i++)
-                        {
-                            if (!Console.IsInputRedirected && Console.KeyAvailable)
-                            {
-                                var key = Console.ReadKey(true);
-                                if (key.Key == ConsoleKey.Escape)
-                                {
-                                    Console.CursorVisible = true;
-                                    DisposeGpuEngineCounters();
-                                    Environment.Exit(0);
-                                }
-                                else if (key.Key == ConsoleKey.H)
-                                {
-                                    showHelpScreen = !showHelpScreen;
-                                    ctx.UpdateTarget(RenderPanel(logFile));
-                                }
-                            }
-                            await Task.Delay(100);
-                        }
-                    }
-                });
-        }
+			while (true)
+			{
+				string logFile = GetMostRecentLogFile(logsFolder);
+				if (logFile == null) logFile = $"log-{DateTime.Now:yyyyMMdd}.txt (Not Found)";
+
+				Console.Clear();
+				Console.SetCursorPosition(0, 0);
+
+				// Um único Live para a vida toda do app - nunca recriado
+				await AnsiConsole.Live(RenderPanel(logFile))
+					.Cropping(VerticalOverflowCropping.Bottom)
+					.StartAsync(async ctx =>
+					{
+						int loopCounter = 0;
+
+						while (true)
+						{
+							try
+							{
+								string foundLog = GetMostRecentLogFile(logsFolder);
+								if (foundLog != null)
+								{
+									logFile = foundLog;
+									ReadSaladLogs(logFile);
+								}
+
+								if (loopCounter % 2 == 0)
+								{
+									UpdateNetwork();
+									UpdateSaladInfo();
+									_ = FetchGpuDemandDataAsync();
+								}
+
+								if (loopCounter % 10 == 0)
+								{
+									UpdateHostHardware();
+									UpdateWSLData();
+									UpdateSgsInfo();
+									UpdateSgsCpuRam();
+								}
+
+								CalculateUptime();
+								if (DetectConsoleResize())
+								{
+									//Console.Clear();
+									//Console.SetCursorPosition(0, 0);
+								}
+
+								var panel = RenderPanel(logFile);
+								ctx.UpdateTarget(panel);
+							}
+							catch
+							{
+								// Ignora falhas pontuais (WMI travando, rede caindo, log rotacionando, etc.)
+								// sem nunca destruir o Live ou limpar a tela.
+							}
+
+							loopCounter++;
+
+							// Check keyboard input
+							for (int i = 0; i < 10; i++)
+							{
+								try
+								{
+									if (!Console.IsInputRedirected && Console.KeyAvailable)
+									{
+										var key = Console.ReadKey(true);
+										if (key.Key == ConsoleKey.Escape)
+										{
+											Console.CursorVisible = true;
+											Environment.Exit(0);
+										}
+										else if (key.Key == ConsoleKey.H)
+										{
+											showHelpScreen = !showHelpScreen;
+											ctx.UpdateTarget(RenderPanel(logFile));
+										}
+										else if (key.Key == ConsoleKey.S)
+										{
+											showSupportTab = !showSupportTab;
+											ctx.UpdateTarget(RenderPanel(logFile));
+										}
+										else if (key.Key == ConsoleKey.N)
+										{
+											useNovaDemandView = !useNovaDemandView;
+											ctx.UpdateTarget(RenderPanel(logFile));
+										}
+										else if (key.Key == ConsoleKey.E)
+										{
+											showErrorHistory = !showErrorHistory;
+											ctx.UpdateTarget(RenderPanel(logFile));
+										}
+										else if (key.Key == ConsoleKey.C)
+										{
+											errorHistory.Clear();
+											lastErrorClearTime = DateTime.Now;
+											ctx.UpdateTarget(RenderPanel(logFile));
+										}
+									}
+								}
+								catch { /* ignora erro pontual de leitura de teclado */ }
+
+								await Task.Delay(100);
+							}
+						}
+					});
+			}
+		}
 
         private static readonly Regex WhitespaceRegex = new(@"\s+", RegexOptions.Compiled);
 
@@ -300,6 +417,26 @@ namespace SaladXRayPanel
             return null;
         }
 
+        static NovatechGpuData FindNovatechMatch(string localGpuName, IEnumerable<NovatechGpuData> novaItems)
+        {
+            if (string.IsNullOrWhiteSpace(localGpuName)) return null;
+            var normalizedLocal = NormalizeGpuName(localGpuName);
+
+            foreach (var item in novaItems)
+            {
+                if (NormalizeGpuName(item.DisplayName) == normalizedLocal) return item;
+            }
+
+            foreach (var item in novaItems)
+            {
+                var normNova = NormalizeGpuName(item.DisplayName);
+                if (normNova.Contains(normalizedLocal) || normalizedLocal.Contains(normNova))
+                    return item;
+            }
+
+            return null;
+        }
+
         static async Task FetchGpuDemandDataAsync()
         {
             if (isFetchingDemand) return;
@@ -323,37 +460,76 @@ namespace SaladXRayPanel
                         return;
                     }
 
-                    string json = await httpClient.GetStringAsync("https://app-api.salad.com/api/v2/demand-monitor/gpu");
-
-                    var options = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
-                    var gpus = JsonSerializer.Deserialize<List<GpuDemandData>>(json, options);
-
-                    var myGpu = FindMatchingGpu(localGpuName, gpus ?? new List<GpuDemandData>());
-
-                    if (myGpu != null)
+                    // 1. NOVATECH primeiro (base maior) - resolve nome canônico
+                    string canonicalName = localGpuName;
+                    try
                     {
-                        gpuDemandStatus = $"[bold green]{myGpu.DisplayName}[/]";
-                        gpuDemandTier = $"[cyan]{myGpu.DemandTierName}[/] (Recommended Host RAM: {myGpu.RecommendedSpecs?.RamGb}GB)";
+                        string novaJson = await httpClient.GetStringAsync("https://salad-tools.novatech.gg/api/gpus");
+                        var novaOptions = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+                        var novaResponse = JsonSerializer.Deserialize<NovatechResponse>(novaJson, novaOptions);
 
-                        double realBusyPct = myGpu.UtilizationPct;
-                        if (realBusyPct < 0) realBusyPct = 0;
-                        if (realBusyPct > 100) realBusyPct = 100;
-
-                        gpuNetworkUtil = $"[yellow]{Math.Round(realBusyPct, 1)}%[/] of active machines working";
-
-                        if (myGpu.EarningRates != null)
+                        if (novaResponse?.Gpus != null)
                         {
-                            double avg24h = myGpu.EarningRates.AvgEarningRate * 24;
-                            double max24h = myGpu.EarningRates.MaxEarningRate * 24;
-                            gpuEarning24h = $"Avg: [bold green]${avg24h:F2}[/] / Max Pico: [bold green]${max24h:F2}[/]";
+                            var novaMatch = FindNovatechMatch(localGpuName, novaResponse.Gpus);
+                            if (novaMatch != null)
+                            {
+                                canonicalName = novaMatch.DisplayName;
+                                novaTier = novaMatch.DemandTier;
+                                novaUtil = novaMatch.Utilization;
+                                novaMinEarning = novaMatch.MinEarningRate;
+                                novaMaxEarning = novaMatch.MaxEarningRate;
+                                novaMatchStatus = $"[bold green]{novaMatch.DisplayName}[/]";
+                                isNovaOnline = true;
+                            }
+                            else
+                            {
+                                novaMatchStatus = $"[darkorange]Not Listed on Novatech[/] [grey]({localGpuName})[/]";
+                                isNovaOnline = false;
+                            }
+                        }
+                        else isNovaOnline = false;
+                    }
+                    catch { isNovaOnline = false; }
+
+                    // 2. SALAD usa o nome canônico da Novatech (fallback: nome local)
+                    try
+                    {
+                        string json = await httpClient.GetStringAsync("https://app-api.salad.com/api/v2/demand-monitor/gpu");
+                        var options = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+                        var gpus = JsonSerializer.Deserialize<List<GpuDemandData>>(json, options);
+
+                        var myGpu = FindMatchingGpu(canonicalName, gpus ?? new List<GpuDemandData>());
+
+                        if (myGpu != null)
+                        {
+                            gpuDemandStatus = $"[bold green]{myGpu.DisplayName}[/]";
+                            gpuDemandTier = $"[cyan]{myGpu.DemandTierName}[/] (Recommended Host RAM: {myGpu.RecommendedSpecs?.RamGb}GB)";
+
+                            double realBusyPct = myGpu.UtilizationPct;
+                            if (realBusyPct < 0) realBusyPct = 0;
+                            if (realBusyPct > 100) realBusyPct = 100;
+
+                            gpuNetworkUtil = $"[yellow]{Math.Round(realBusyPct, 1)}%[/] of active machines working";
+
+                            if (myGpu.EarningRates != null)
+                            {
+                                double avg24h = myGpu.EarningRates.AvgEarningRate * 24;
+                                double max24h = myGpu.EarningRates.MaxEarningRate * 24;
+                                gpuEarning24h = $"Avg: [bold green]${avg24h:F2}[/] / Max Pico: [bold green]${max24h:F2}[/]";
+                            }
+                        }
+                        else
+                        {
+                            gpuDemandStatus = $"[darkorange]Not Listed[/] [grey]({localGpuName})[/]";
+                            gpuDemandTier = "[grey]Low/No Demand[/]";
+                            gpuNetworkUtil = "[grey]N/A[/]";
+                            gpuEarning24h = "[grey]N/A[/]";
                         }
                     }
-                    else
+                    catch
                     {
-                        gpuDemandStatus = $"[darkorange]Not Listed[/] [grey]({localGpuName})[/]";
-                        gpuDemandTier = "[grey]Low/No Demand[/]";
-                        gpuNetworkUtil = "[grey]N/A[/]";
-                        gpuEarning24h = "[grey]N/A[/]";
+                        gpuDemandStatus = "[red]Salad API Offline or Error[/]";
+                        gpuDemandTier = "[grey]N/A[/]";
                     }
                 });
 
@@ -551,6 +727,261 @@ namespace SaladXRayPanel
             if (saladVersion == "Detecting...") saladVersion = "Unknown";
         }
 
+        static void UpdateWSLData()
+        {
+            try
+            {
+                var wslProcs = Process.GetProcesses();
+                try
+                {
+                    long ramTotalBytes = wslProcs
+                        .Where(p => p.ProcessName == "vmmemWSL" || p.ProcessName == "vmmem" || p.ProcessName == "wslhost")
+                        .Sum(p => p.WorkingSet64);
+                    wslRamMB = ramTotalBytes / 1048576.0;
+                    ramUsage = wslRamMB > 0 ? $"{wslRamMB:N1} MB" : "Awaiting WSL...";
+
+                    // --- UPTIME WSL ---
+                    var oldestWsl = wslProcs.OrderBy(p => { try { return p.StartTime; } catch { return DateTime.MaxValue; } }).FirstOrDefault();
+                    if (oldestWsl != null)
+                    {
+                        DateTime? safeStartTime = null;
+                        try { safeStartTime = oldestWsl.StartTime; }
+                        catch
+                        {
+                            try
+                            {
+                                using (var searcher = new ManagementObjectSearcher($"SELECT CreationDate FROM Win32_Process WHERE ProcessId = {oldestWsl.Id}"))
+                                {
+                                    foreach (ManagementObject obj in searcher.Get())
+                                    {
+                                        string wmiDate = obj["CreationDate"]?.ToString();
+                                        if (!string.IsNullOrEmpty(wmiDate)) safeStartTime = ManagementDateTimeConverter.ToDateTime(wmiDate);
+                                    }
+                                }
+                            }
+                            catch { }
+                        }
+                        wslStartTime = safeStartTime ?? DateTime.Now;
+                    }
+                    else
+                    {
+                        wslStartTime = DateTime.MinValue;
+                    }
+                }
+                finally
+                {
+                    foreach (var p in wslProcs) p.Dispose();
+                }
+
+                ProcessStartInfo psi = new ProcessStartInfo { FileName = "wsl.exe", Arguments = "-l -v", RedirectStandardOutput = true, UseShellExecute = false, CreateNoWindow = true, StandardOutputEncoding = System.Text.Encoding.Unicode };
+                using (Process proc = Process.Start(psi))
+                {
+                    string output = proc.StandardOutput.ReadToEnd().Replace("\0", "");
+                    var matchWsl = Regex.Match(output, @"salad-enterprise-linux\s+([A-Za-z]+)");
+                    if (matchWsl.Success) { string state = matchWsl.Groups[1].Value; wslStatusStr = state.Contains("Running") ? "Running (Active)" : state.Contains("Stopped") ? "STOPPED (Offline)" : state; }
+                }
+            }
+            catch { wslStatusStr = "Error reading WSL"; wslRamMB = 0; }
+
+            if (wslStatusStr.Contains("STOPPED") || wslStatusStr.Contains("Offline") || wslStatusStr.Contains("Error") || wslStatusStr.Contains("Pending"))
+            {
+                if (containerStatus.Contains("Running"))
+                {
+                    containerStatus = "[yellow]Waiting for WSL...[/]";
+                }
+            }
+        }
+		static void InitializeCounterNames()
+		{
+			if (_categoryName != null) return;
+			if (PerformanceCounterCategory.Exists("Processo"))
+			{
+				_categoryName = "Processo";
+				_counterName = "Outros bytes de E/S/s";
+				_idCounterName = "ID do processo";
+			}
+			else
+			{
+				_categoryName = "Process";
+				_counterName = "IO Other Bytes/sec";
+				_idCounterName = "ID Process";
+			}
+		}
+
+		static string GetProcessInstanceNameUnified(int pid, string processName)
+		{
+			try
+			{
+				var cat = new PerformanceCounterCategory(_categoryName);
+				string[] instances = cat.GetInstanceNames();
+
+				foreach (var instance in instances)
+				{
+					if (instance.StartsWith(processName, StringComparison.OrdinalIgnoreCase))
+					{
+						using var cnt = new PerformanceCounter(_categoryName, _idCounterName, instance, true);
+						if ((int)cnt.NextValue() == pid) return instance;
+					}
+				}
+			}
+			catch { }
+			return processName;
+		}
+
+		static string FormatNetworkSpeed(double bps)
+		{
+			if (bps < 0) bps = 0;
+			if (bps < 1000) return $"{bps:F0} bps";
+			if (bps < 1000000) return $"{bps / 1000.0:F1} Kbps";
+			return $"{bps / 1000000.0:F1} Mbps";
+		}
+
+		static string CalculateSgsNetworkSpeed(Process sgsProcess)
+		{
+			if (sgsProcess == null)
+			{
+				_sgsNetCounter?.Dispose();
+				_sgsNetCounter = null;
+				_sgsNetCounterPid = -1;
+				return "0 bps";
+			}
+
+			try
+			{
+				int pid = sgsProcess.Id;
+				string processName = sgsProcess.ProcessName;
+
+				if (_sgsNetCounter == null || _sgsNetCounterPid != pid)
+				{
+					_sgsNetCounter?.Dispose();
+					string instance = GetProcessInstanceNameUnified(pid, processName);
+					_sgsNetCounter = new PerformanceCounter(_categoryName, _counterName, instance, true);
+					_sgsNetCounter.NextValue(); // aquecimento
+					_sgsNetCounterPid = pid;
+					return "0 bps";
+				}
+
+				float bytesPerSec = _sgsNetCounter.NextValue();
+				double bps = bytesPerSec * 8.0;
+				return FormatNetworkSpeed(bps);
+			}
+			catch
+			{
+				_sgsNetCounter?.Dispose();
+				_sgsNetCounter = null;
+				_sgsNetCounterPid = -1;
+				return "0 bps";
+			}
+		}
+
+		static void UpdateSgsInfo()
+		{
+			Process[] allProcesses = null;
+			try
+			{
+				allProcesses = Process.GetProcesses();
+				var sgsProcesses = allProcesses
+					.Where(p => {
+						try { return p.ProcessName.StartsWith("sgs", StringComparison.OrdinalIgnoreCase); }
+						catch { return false; }
+					})
+					.ToList();
+
+				if (sgsProcesses.Count > 0)
+				{
+					var oldestSgs = sgsProcesses.OrderBy(p => { try { return p.StartTime; } catch { return DateTime.MaxValue; } }).FirstOrDefault();
+					if (oldestSgs != null)
+					{
+						DateTime? safeStartTime = null;
+						try { safeStartTime = oldestSgs.StartTime; }
+						catch
+						{
+							try
+							{
+								using (var searcher = new ManagementObjectSearcher($"SELECT CreationDate FROM Win32_Process WHERE ProcessId = {oldestSgs.Id}"))
+								{
+									foreach (ManagementObject obj in searcher.Get())
+									{
+										string wmiDate = obj["CreationDate"]?.ToString();
+										if (!string.IsNullOrEmpty(wmiDate)) safeStartTime = ManagementDateTimeConverter.ToDateTime(wmiDate);
+									}
+								}
+							}
+							catch { }
+						}
+						sgsStartTime = safeStartTime ?? DateTime.Now;
+						sgsStatus = "Online";
+					}
+
+					InitializeCounterNames();
+					sgsNetworkSpeed = CalculateSgsNetworkSpeed(oldestSgs);
+				}
+				else
+				{
+					sgsStartTime = DateTime.MinValue;
+					sgsStatus = "Offline";
+					sgsNetworkSpeed = CalculateSgsNetworkSpeed(null);
+				}
+			}
+			catch { }
+			finally { if (allProcesses != null) foreach (var p in allProcesses) p.Dispose(); }
+		}
+
+		static void UpdateSgsCpuRam()
+		{
+			try
+			{
+				using var searcher = new ManagementObjectSearcher(
+					"SELECT Name, PercentProcessorTime, Timestamp_Sys100NS, WorkingSetPrivate FROM Win32_PerfRawData_PerfProc_Process WHERE Name LIKE 'sgs%'");
+
+				double sgsCpuAccumulated = 0;
+				ulong sgsRamBytesAccumulated = 0;
+				int cores = Environment.ProcessorCount;
+				var activeNames = new HashSet<string>();
+
+				using var collection = searcher.Get();
+				foreach (ManagementObject obj in collection)
+				{
+					string name = obj["Name"]?.ToString();
+					if (string.IsNullOrEmpty(name)) continue;
+					if (name.Contains("XRay", StringComparison.OrdinalIgnoreCase)) continue;
+
+					activeNames.Add(name);
+
+					ulong currentRawCpu = Convert.ToUInt64(obj["PercentProcessorTime"] ?? 0);
+					ulong currentTimestamp = Convert.ToUInt64(obj["Timestamp_Sys100NS"] ?? 0);
+					ulong workingSetPrivate = Convert.ToUInt64(obj["WorkingSetPrivate"] ?? 0);
+
+					sgsRamBytesAccumulated += workingSetPrivate;
+
+					if (_sgsCpuHistory.TryGetValue(name, out var prev))
+					{
+						long deltaCpu = (long)currentRawCpu - (long)prev.PercentProcessorTime;
+						long deltaTicks = (long)currentTimestamp - (long)prev.TimestampSys100NS;
+
+						if (deltaTicks > 0 && deltaCpu >= 0)
+						{
+							double instancePct = ((double)deltaCpu / deltaTicks) * 100.0;
+							sgsCpuAccumulated += instancePct;
+						}
+					}
+
+					_sgsCpuHistory[name] = (currentRawCpu, currentTimestamp);
+				}
+
+				var staleKeys = _sgsCpuHistory.Keys.Where(k => !activeNames.Contains(k)).ToList();
+				foreach (var key in staleKeys) _sgsCpuHistory.Remove(key);
+
+				sgsCpuUsagePct = cores > 0 ? Math.Clamp(sgsCpuAccumulated / cores, 0, 100) : 0;
+				sgsRamMB2 = sgsRamBytesAccumulated / (1024.0 * 1024.0);
+			}
+			catch
+			{
+				sgsCpuUsagePct = 0;
+				sgsRamMB2 = 0;
+			}
+		}
+
         static void RestoreInitialState(string logsFolder)
         {
             string currentFile = GetMostRecentLogFile(logsFolder);
@@ -627,6 +1058,45 @@ namespace SaladXRayPanel
                 }
             } catch { }
         }
+		
+		static string BuildGenericWorkloadTag(string typedName)
+		{
+			var parts = typedName.Split(':', 2);
+			string kind = parts[0].ToLowerInvariant();
+			string name = parts.Length > 1 ? parts[1] : parts[0];
+
+			string icon = kind switch
+			{
+				"miner" => ":pick:",
+				"container" => ":package:",
+				"compute" => ":gear:",
+				_ => ":question_mark:"
+			};
+
+			return $"[yellow]{icon} {Markup.Escape(name)}[/]";
+		}
+
+		static string BuildWorkloadTypeDisplay(string compute, bool bandwidth)
+		{
+			string computePart = compute switch
+			{
+				"GPU" => "[bold orange1]:fire: GPU[/]",
+				"CPU" => "[cyan]:gear: CPU[/]",
+				string s when s.Contains(":") => BuildGenericWorkloadTag(s),
+				_ => null
+			};
+
+			string bandwidthPart = bandwidth ? "[blue]:globe_with_meridians: Bandwidth[/]" : null;
+
+			if (computePart != null && bandwidthPart != null)
+				return $"{computePart} + {bandwidthPart}";
+			if (computePart != null)
+				return computePart;
+			if (bandwidthPart != null)
+				return bandwidthPart;
+
+			return "[grey]N/A[/]";
+		}
 
         static void ProcessLogLine(string line, bool isStartup = false)
         {
@@ -660,20 +1130,6 @@ namespace SaladXRayPanel
                 balance = matchWallet.Groups[1].Value; projected = matchWallet.Groups[2].Value; lastWalletUpdate = timestampLog;
             }
 
-            var matchWorkload = Regex.Match(line, @"salad\.com/sce/([a-f0-9\-]+)");
-            if (matchWorkload.Success && !line.Contains("TTL =") && !line.Contains("pullDuration"))
-                        {
-                string newJobId = matchWorkload.Groups[1].Value;
-                if (jobId != newJobId)
-                {
-                    jobId = newJobId;
-                    if (!isStartup) jobStartTime = FindRealJobStartTime(newJobId, SaladLogDirectory + Path.DirectorySeparatorChar);
-                    containerStatus = "Starting..."; matrixStatus = "[yellow]Initializing new job...[/]";
-                    initialPercentTracker = -1; initialMbTracker = 0; lastEstimatedMB = 0; totalPullingMB = 0; isPullingState = false;
-                    globalProgress = 0.0;
-                }
-            }
-
             var matchLayer = Regex.Match(line, @"Pull progress event: .*?@sha256:([a-f0-9]{8})[a-f0-9]*\s([0-9.]+)");
             if (matchLayer.Success)
             {
@@ -692,11 +1148,13 @@ namespace SaladXRayPanel
 
                     if (!isStartup)
                     {
-                        if (initialPercentTracker == -1 || percentage < globalProgress)
-                        {
-                            initialPercentTracker = percentage;
-                            initialMbTracker = totalPullingMB;
-                        }
+						const double SignificantDropThreshold = 5.0; // só reseta se cair mais que 5%
+
+						if (initialPercentTracker == -1 || percentage < (globalProgress - SignificantDropThreshold))
+						{
+							initialPercentTracker = percentage;
+							initialMbTracker = totalPullingMB;
+						}
 
                         double deltaPercentage = percentage - initialPercentTracker;
                         double deltaMB = totalPullingMB - initialMbTracker;
@@ -760,37 +1218,139 @@ namespace SaladXRayPanel
                 }
             }
 
-            if (line.Contains("Running(Ready") || line.Contains("already running") || line.Contains("already installed")) { containerStatus = "[green]Running (Stable)[/]"; isPullingState = false; globalProgress = 0.0; }
-            else if (line.Contains("Killed") || line.Contains("Stopped") || line.Contains("failed"))
+            // Captura qualquer variação de container ativo/rodando do Salad e do Matrix
+            if (line.Contains("Running(Ready", StringComparison.OrdinalIgnoreCase) || 
+                line.Contains("[Running]", StringComparison.OrdinalIgnoreCase) || 
+                line.Contains(":Running", StringComparison.OrdinalIgnoreCase) || 
+                line.Contains("already running", StringComparison.OrdinalIgnoreCase) || 
+                line.Contains("already installed", StringComparison.OrdinalIgnoreCase))
             {
-                if (globalProgress > 0 && globalProgress < 100)
-                {
-                    containerStatus = $"[darkorange]Network Hiccup / Retrying... (Frozen at {globalProgress}%)[/]";
-                }
-                else
-                {
-                    isPullingState = false;
-                    containerStatus = "[grey]Stopped / Waiting[/]";
-                    matrixStatus = "[grey]Idle - Searching for jobs...[/]";
-                    globalProgress = 0.0;
-                }
+                containerStatus = "[green]Running (Active)[/]";
+                isPullingState = false;
+                globalProgress = 100.0;
+            }
+            else if (line.Contains("Killed", StringComparison.OrdinalIgnoreCase) || 
+                     line.Contains("Stopped workload", StringComparison.OrdinalIgnoreCase) ||
+                     line.Contains("Stopping workload", StringComparison.OrdinalIgnoreCase))
+            {
+                isPullingState = false;
+                containerStatus = "[grey]Stopped / Waiting[/]";
+                matrixStatus = "[grey]Idle - Searching for jobs...[/]";
+                globalProgress = 0.0;
+                computeWorkloadType = null;
+                workloadHardwareType = BuildWorkloadTypeDisplay(computeWorkloadType, isBandwidthActive);
             }
 
-            var matchBandwidthNode = Regex.Match(line, @"(Bandwidth-[a-zA-Z0-9\-]+)");
-            if (matchBandwidthNode.Success) { bandwidthStatus = "[magenta]Active[/]"; sgsNodeName = matchBandwidthNode.Groups[1].Value; }
+			if (line.Contains("OrchestrationEvent: Workloads"))
+			{
+				// Início de um novo lote de workloads reportado pelo matrix.
+				// Reseta o estado antes de reprocessar as linhas deste ciclo,
+				// assim se o SGS/miner não aparecer mais nesse lote, ele
+				// automaticamente deixa de ser considerado ativo, sem depender
+				// de uma frase exata de "Stopping workload" que nem sempre é emitida.
+				isBandwidthActive = false;
+				computeWorkloadType = null;
+			}
 
-            if (line.Contains("Stopping workload") && line.Contains("Bandwidth")) { bandwidthStatus = "[grey]Idle[/]"; sgsNodeName = "Waiting for node..."; }
+			var matchBandwidthNode = Regex.Match(line, @"(Bandwidth-[a-zA-Z0-9\-]+)");
+			if (matchBandwidthNode.Success)
+			{
+				isBandwidthActive = true;
+				workloadHardwareType = BuildWorkloadTypeDisplay(computeWorkloadType, isBandwidthActive);
+			}
 
-		if (line.Contains("[WRN]") || line.Contains("[ERR]"))
-		{
-		    string level = line.Contains("[ERR]") ? "ERR" : "WRN";
-		    var matchError = Regex.Match(line, @"\[(?:WRN|ERR)\]\s+(.*)");
-		    string rawMsg = matchError.Success ? matchError.Groups[1].Value : line;
+			var matchWorkloadReceived = Regex.Match(line, @"Workload Received: \(([a-zA-Z0-9]+) -> (.+?)\s*,\s*(\w+)\)");
+			if (matchWorkloadReceived.Success)
+			{
+				string wlShortId = matchWorkloadReceived.Groups[1].Value.Trim();
+				string wlName    = matchWorkloadReceived.Groups[2].Value.Trim();
+				string wlKind    = matchWorkloadReceived.Groups[3].Value.Trim().ToLowerInvariant();
 
-		    lastErrorLevel = level;
-		    lastWarning = rawMsg.Length > 85 ? rawMsg.Substring(0, 82) + "..." : rawMsg;
-		}
+				if (wlName.Contains("Bandwidth", StringComparison.OrdinalIgnoreCase))
+				{
+					// SGS / Bandwidth - mantido isolado
+				}
+				else if (wlKind == "miner")
+				{
+					// É MINERADOR: o nome real é limpo (TeamRedMiner, T-Rex, XMRig)
+					computeWorkloadType = $"miner:{wlName}";
+					workloadHardwareType = BuildWorkloadTypeDisplay(computeWorkloadType, isBandwidthActive);
+					jobId = wlShortId;
+				}
+				else // É CONTAINER
+				{
+					// Se ainda não descobrimos se é CPU ou GPU, coloca "GPU" provisório,
+					// a menos que já tenha sido marcado como CPU
+					if (computeWorkloadType != "CPU")
+					{
+						computeWorkloadType = "GPU";
+					}
 
+					workloadHardwareType = BuildWorkloadTypeDisplay(computeWorkloadType, isBandwidthActive);
+
+					// Pega apenas os 8 primeiros caracteres como ID limpo
+					string cleanId = wlShortId.Length > 8 ? wlShortId.Substring(0, 8) : wlShortId;
+
+					if (jobId != cleanId)
+					{
+						jobId = cleanId;
+						if (!string.IsNullOrEmpty(jobId))
+							jobStartTime = FindRealJobStartTime(jobId, SaladLogDirectory + Path.DirectorySeparatorChar);
+
+						containerStatus = "Starting...";
+						initialPercentTracker = -1; 
+						initialMbTracker = 0; 
+						lastEstimatedMB = 0; 
+						totalPullingMB = 0; 
+						isPullingState = false;
+						globalProgress = 0.0;
+					}
+				}
+			}
+
+			// =========================================================================
+			// IDENTIFICAÇÃO DEFINITIVA DO HARDWARE (BLINDADA CONTRA MINERADOR)
+			// =========================================================================
+			bool isMiningLocked = computeWorkloadType != null && computeWorkloadType.StartsWith("miner:", StringComparison.OrdinalIgnoreCase);
+
+			// Se for minerador confirmado, NADA ABAIXO pode sobrescrever!
+			if (!isMiningLocked)
+			{
+				if (line.Contains("CPU HardwareCompatibility", StringComparison.OrdinalIgnoreCase))
+				{
+					computeWorkloadType = "CPU";
+					workloadHardwareType = BuildWorkloadTypeDisplay(computeWorkloadType, isBandwidthActive);
+				}
+				else if (line.Contains("GPU HardwareCompatibility", StringComparison.OrdinalIgnoreCase))
+				{
+					// Só crava GPU se não for minerador e não tiver sido confirmado como CPU
+					if (computeWorkloadType != "CPU")
+					{
+						computeWorkloadType = "GPU";
+						workloadHardwareType = BuildWorkloadTypeDisplay(computeWorkloadType, isBandwidthActive);
+					}
+				}
+				else if (string.IsNullOrEmpty(computeWorkloadType))
+				{
+					if (line.Contains("miner", StringComparison.OrdinalIgnoreCase) && !line.Contains("sgs", StringComparison.OrdinalIgnoreCase))
+					{
+						computeWorkloadType = "MINER";
+						workloadHardwareType = BuildWorkloadTypeDisplay(computeWorkloadType, isBandwidthActive);
+					}
+				}
+			}
+
+			if (line.Contains("[ERR]"))
+			{
+				var matchError = Regex.Match(line, @"\[ERR\]\s+(.*)");
+				string rawMsg = matchError.Success ? matchError.Groups[1].Value : line;
+				string trimmed = rawMsg.Length > 105 ? rawMsg.Substring(0, 102) + "..." : rawMsg;
+
+				errorHistory.Enqueue((DateTime.Now, trimmed));
+				if (errorHistory.Count > MaxErrorHistory)
+					errorHistory.Dequeue();
+			}
+			
             if (line.Contains("Heartbeat"))
             {
                 lastLogHeartbeat = DateTime.Now;
@@ -833,66 +1393,18 @@ namespace SaladXRayPanel
                 }
                 lastVNetRx = currentHostRx; lastVNetTx = currentHostTx; lastVNetTime = now;
             } catch { }
-
-            long currentSgsRx = 0, currentSgsTx = 0, currentSgsRam = 0; bool isProcessFound = false;
-            Process[] allSgsScan = Process.GetProcesses();
-            try
-            {
-                var sgsProcs = allSgsScan.Where(p => p.ProcessName.StartsWith("sgs", StringComparison.OrdinalIgnoreCase) || p.ProcessName.StartsWith("v2ray", StringComparison.OrdinalIgnoreCase) || p.ProcessName.StartsWith("ss-local", StringComparison.OrdinalIgnoreCase)).ToList();
-                if (sgsProcs.Count > 0)
-                {
-                    isProcessFound = true; currentSgsRam = sgsProcs.Sum(p => p.WorkingSet64);
-                    string wqlPids = string.Join(" OR ", sgsProcs.Select(p => $"ProcessId={p.Id}"));
-                    using (ManagementObjectSearcher searcher = new ManagementObjectSearcher($"SELECT ReadTransferCount, WriteTransferCount FROM Win32_Process WHERE {wqlPids}"))
-                    using (ManagementObjectCollection results = searcher.Get())
-                    {
-                        foreach (ManagementObject obj in results)
-                        {
-                            using (obj)
-                            {
-                                currentSgsRx += Convert.ToInt64(obj["ReadTransferCount"] ?? 0); currentSgsTx += Convert.ToInt64(obj["WriteTransferCount"] ?? 0);
-                            }
-                        }
-                    }
-                }
-                DateTime now = DateTime.Now;
-                if (isProcessFound)
-                {
-                    if (lastSgsTime != DateTime.MinValue)
-                    {
-                        double diff = (now - lastSgsTime).TotalSeconds;
-                        if (diff > 0)
-                        {
-                            long rxDiff = currentSgsRx > lastSgsRx ? currentSgsRx - lastSgsRx : 0;
-                            long txDiff = currentSgsTx > lastSgsTx ? currentSgsTx - lastSgsTx : 0;
-                            sgsTotalRxMB += rxDiff / 1048576.0; sgsTotalTxMB += txDiff / 1048576.0;
-                            double rxKbps = (rxDiff / diff) / 1024.0; double txKbps = (txDiff / diff) / 1024.0;
-                            string rxStr = rxKbps >= 1024 ? $"[bold green]{rxKbps / 1024.0:F2} MB/s[/]" : $"{rxKbps:F1} KB/s";
-                            string txStr = txKbps >= 1024 ? $"[bold fuchsia]{txKbps / 1024.0:F2} MB/s[/]" : $"{txKbps:F1} KB/s";
-                            sgsDetails = $"[[ IN: {rxStr} | OUT: {txStr} ]] (RAM Usage: {currentSgsRam / 1048576.0:F1} MB)";
-                            sgsTotalTraffic = $"{sgsTotalRxMB:F2} MB (IN) | {sgsTotalTxMB:F2} MB (OUT)";
-                        }
-                    }
-                    lastSgsRx = currentSgsRx; lastSgsTx = currentSgsTx; lastSgsTime = now;
-                }
-                else { sgsDetails = "[grey]Network process idle or waiting...[/]"; lastSgsTime = DateTime.MinValue; }
-            }
-            catch { }
-            finally
-            {
-                foreach (var p in allSgsScan) p.Dispose();
-            }
-	}
+		}
 
         static void CalculateUptime()
         {
-            if (jobStartTime != DateTime.MinValue && jobId != "Pending..." && containerStatus.Contains("Running"))
+            if (wslStartTime != DateTime.MinValue && wslStatusStr.Contains("Running"))
             {
-                var diff = DateTime.Now - jobStartTime;
-                if (diff.TotalSeconds < 0) diff = TimeSpan.Zero;
-                workTime = diff.TotalHours >= 1 ? $"{(int)diff.TotalHours}h {diff.Minutes}m" : $"{diff.Minutes}m {diff.Seconds}s";
+                workTime = FormatUptime(DateTime.Now - wslStartTime);
             }
-            else workTime = "Waiting...";
+            else
+            {
+                workTime = "[grey]Offline[/]";
+            }
 
             if (lastWalletUpdate != DateTime.MinValue)
             {
@@ -1036,316 +1548,90 @@ namespace SaladXRayPanel
             }
         }
 
-        // ==========================================
-        // SALAD PROCESS TREE EXCLUSION
-        // ==========================================
-	        static readonly HashSet<string> SaladRootProcessNames = new(StringComparer.OrdinalIgnoreCase)
-	{
-	    "salad", "salad (amd edition)", "salad.bowl.service",
-	    "wsl", "wslhost", "vmmemwsl", "vmmem",
-	    "wslservice", "wslrelay", "lxssmanager", "hvsimhost"
-	};
-
-	static Dictionary<int, (int parentPid, string name)> processTreeSnapshot = new();
-	static DateTime lastProcessTreeSnapshot = DateTime.MinValue;
-	static readonly TimeSpan ProcessTreeSnapshotTtl = TimeSpan.FromSeconds(10);
-
-	static void RefreshProcessTreeSnapshotIfNeeded()
-	{
-	    if ((DateTime.Now - lastProcessTreeSnapshot) < ProcessTreeSnapshotTtl && processTreeSnapshot.Count > 0)
-	        return;
-
-	    var snapshot = new Dictionary<int, (int parentPid, string name)>();
-	    try
-	    {
-	        using var searcher = new ManagementObjectSearcher("SELECT ProcessId, ParentProcessId, Name FROM Win32_Process");
-	        using var results = searcher.Get();
-	        foreach (ManagementObject mo in results)
-	        {
-	            try
-	            {
-	                int pid = Convert.ToInt32(mo["ProcessId"]);
-	                int parentPid = 0;
-	                try { parentPid = Convert.ToInt32(mo["ParentProcessId"]); } catch { }
-	                string name = Path.GetFileNameWithoutExtension(mo["Name"]?.ToString() ?? "");
-	                snapshot[pid] = (parentPid, name);
-	            }
-	            finally { mo.Dispose(); }
-	        }
-	    }
-	    catch { return; }
-
-	    processTreeSnapshot = snapshot;
-	    lastProcessTreeSnapshot = DateTime.Now;
-	}
-
-	static bool IsUnderSaladTree(int pid)
-	{
-	    RefreshProcessTreeSnapshotIfNeeded();
-
-	    var visited = new HashSet<int>();
-	    int currentPid = pid;
-
-	    while (currentPid > 0 && visited.Add(currentPid))
-	    {
-	        if (!processTreeSnapshot.TryGetValue(currentPid, out var info))
-	            break;
-
-	        if (SaladRootProcessNames.Contains(info.name)) return true;
-	        currentPid = info.parentPid;
-	    }
-	    return false;
-	}
-
-	static bool IsUnderSaladTreeCached(int pid)
-	{
-	    if (saladTreeCache.TryGetValue(pid, out var cached) &&
-	        (DateTime.Now - cached.cachedAt) < SaladTreeCacheTtl)
-	    {
-	        return cached.result;
-	    }
-
-	    bool result = IsUnderSaladTree(pid);
-	    saladTreeCache[pid] = (result, DateTime.Now);
-	    return result;
-	}
-
-        static string ClassifyMinerScope(int pid, string processName)
-        {
-            if (minerScopeCache.TryGetValue(pid, out string cached)) return cached;
-
-            bool internalScope = IsUnderSaladTree(pid);
-            string scope = internalScope ? "INTERNAL" : "EXTERNAL";
-            minerScopeCache[pid] = scope;
-            return scope;
-        }
-
-        // ==========================================
-        // GPU ENGINE HEURISTIC (SUSPECTED MINER DETECTION)
-        // ==========================================
-        static readonly Regex GpuEngineInstanceRegex = new(
-            @"pid_(?<pid>\d+)_.*_engtype_(?<type>\w+)",
-            RegexOptions.Compiled);
-
-        static bool TryParseGpuEngineInstance(string instanceName, out int pid, out string engineType)
-        {
-            var m = GpuEngineInstanceRegex.Match(instanceName);
-            if (m.Success)
-            {
-                pid = int.Parse(m.Groups["pid"].Value);
-                engineType = m.Groups["type"].Value;
-                return true;
-            }
-            pid = 0;
-            engineType = null;
-            return false;
-        }
-
-        static void RefreshGpuEngineCounters()
-        {
-            if (gpuEngineCountersInitFailed) return;
-
-            try
-            {
-                gpuEngineCategory ??= new PerformanceCounterCategory("GPU Engine");
-                var currentInstances = gpuEngineCategory.GetInstanceNames();
-
-                var toRemove = gpuEngineCounters.Keys.Except(currentInstances).ToList();
-                foreach (var key in toRemove)
-                {
-                    gpuEngineCounters[key].Dispose();
-                    gpuEngineCounters.Remove(key);
-                }
-
-                foreach (var inst in currentInstances)
-                {
-                    if (!gpuEngineCounters.ContainsKey(inst))
-                    {
-                        try
-                        {
-                            var counter = new PerformanceCounter("GPU Engine", "Utilization Percentage", inst, readOnly: true);
-                            gpuEngineCounters[inst] = counter;
-                        }
-                        catch { }
-                    }
-                }
-
-                lastGpuEngineRefresh = DateTime.Now;
-            }
-            catch
-            {
-                gpuEngineCountersInitFailed = true;
-            }
-        }
-
-        static Dictionary<(int pid, string type), float> GetGpuUsageByPidAndEngine()
-        {
-            var result = new Dictionary<(int, string), float>();
-
-            if (gpuEngineCountersInitFailed) return result;
-
-            if ((DateTime.Now - lastGpuEngineRefresh).TotalSeconds > 5)
-                RefreshGpuEngineCounters();
-
-            foreach (var kvp in gpuEngineCounters)
-            {
-                if (!TryParseGpuEngineInstance(kvp.Key, out int pid, out string type))
-                    continue;
-
-                float value;
-                try { value = kvp.Value.NextValue(); }
-                catch { continue; }
-
-                var key = (pid, type);
-                result[key] = result.TryGetValue(key, out var existing) ? existing + value : value;
-            }
-
-            return result;
-        }
-
-        static string ClassifyProcessGpuBehavior(int pid, Dictionary<(int, string), float> usageMap)
-        {
-            float pct3D = usageMap.TryGetValue((pid, "3D"), out var v1) ? v1 : 0f;
-            float pctCompute = usageMap.TryGetValue((pid, "Compute"), out var v2) ? v2 : 0f;
-            float pctVideoEnc = usageMap.TryGetValue((pid, "VideoEncode"), out var v3) ? v3 : 0f;
-
-            if (pctCompute > 30 && pct3D < 5 && pctVideoEnc < 5)
-                return "SUSPECTED_MINER";
-            if (pct3D > 15)
-                return "GAME_OR_RENDER";
-            if (pctCompute > 5 || pct3D > 5)
-                return "UNKNOWN_GPU_APP";
-            return "IDLE";
-        }
-
-        static void DisposeGpuEngineCounters()
-        {
-            foreach (var c in gpuEngineCounters.Values) c.Dispose();
-            gpuEngineCounters.Clear();
-        }
-
         static void UpdateHostHardware()
         {
-            try
-            {
-                string[] minerNames = { "t-rex", "trex", "gminer", "srbminer", "xmrig", "nbminer", "lolminer", "excavator", "rigel", "bzminer", "phoenixminer", "miner" };
-                bool minerFound = false;
-                int knownMinerPid = -1;
-
-                // 1ª checagem: nome conhecido de miner
-                foreach (string mName in minerNames)
-                {
-                    Process[] procs = Process.GetProcessesByName(mName);
-                    if (procs.Length > 0)
-                    {
-                        var proc = procs[0];
-                        knownMinerPid = proc.Id;
-                        string scope = ClassifyMinerScope(proc.Id, proc.ProcessName);
-                        string color = scope == "INTERNAL" ? "cyan" : "orange3";
-
-                        minerStatus = $"[{color}][[ {scope} MINER - {proc.ProcessName.ToUpper()} ]][/]";
-                        minerFound = true;
-
-                        foreach (var p in procs) p.Dispose();
-                        break;
-                    }
-                }
-
-                // 2ª checagem: heurística de comportamento (Compute alto, 3D baixo)
-                // Só roda se a GPU estiver com carga relevante — evita gasto constante em idle
-                if (!minerFound && currentGpuLoadPct >= 40)
-                {
-                    var gpuUsageMap = GetGpuUsageByPidAndEngine();
-                    var distinctPids = gpuUsageMap.Keys.Select(k => k.Item1).Distinct();
-                    int myProcessId = Process.GetCurrentProcess().Id;
-
-			foreach (int pid in distinctPids)
-			{
-			    if (pid == myProcessId || pid == knownMinerPid) continue;
-
-			    string pidName = null;
-			    try
-			    {
-			        using var pProbe = Process.GetProcessById(pid);
-			        pidName = pProbe.ProcessName;
-			    }
-			    catch { continue; } // processo já morreu
-
-			    if (SaladRootProcessNames.Contains(pidName)) continue;
-
-			    if (IsUnderSaladTreeCached(pid)) continue;
-
-			    string behavior = ClassifyProcessGpuBehavior(pid, gpuUsageMap);
-
-                        if (behavior == "SUSPECTED_MINER")
-                        {
-                            string procName = "unknown";
-                            try
-                            {
-                                using var p = Process.GetProcessById(pid);
-                                procName = p.ProcessName;
-                            }
-                            catch { continue; } // processo já morreu, ignora
-
-                            minerStatus = $"[darkorange][[ SUSPECTED MINER - {procName.ToUpper()} (EXTERNAL) ]][/]";
-                            minerFound = true;
-                            break;
-                        }
-                    }
-                }
-
-                if (!minerFound)
-                {
-                    minerStatus = "[grey]Idle[/]";
-
-                    // Limpa caches periodicamente (evita crescimento infinito)
-			if ((DateTime.Now - lastMinerCacheClear).TotalMinutes > 10)
-			{
-			    minerScopeCache.Clear();
-			    saladTreeCache.Clear();
-			    lastMinerCacheClear = DateTime.Now;
-			}
-                }
-            }
-            catch
-            {
-                minerStatus = "[red]Error Checking[/]";
-            }
-
+            // 1. CPU
             try
             {
                 using (ManagementObjectSearcher searcher = new ManagementObjectSearcher("SELECT LoadPercentage, Name FROM Win32_Processor"))
                 {
-                    foreach (ManagementObject obj in searcher.Get()) { txtCpu = $"{obj["Name"]?.ToString() ?? "CPU"} (Load: {obj["LoadPercentage"]?.ToString() ?? "0"}%)"; break; }
+                    foreach (ManagementObject obj in searcher.Get()) 
+                    { 
+                        txtCpu = $"{obj["Name"]?.ToString() ?? "CPU"} (Load: {obj["LoadPercentage"]?.ToString() ?? "0"}%)"; 
+                        break; 
+                    }
                 }
+            }
+            catch { txtCpu = "CPU (Load: N/A)"; }
+
+            // 2. RAM
+            try
+            {
                 using (ManagementObjectSearcher searcher = new ManagementObjectSearcher("SELECT TotalVisibleMemorySize, FreePhysicalMemory FROM Win32_OperatingSystem"))
                 {
                     foreach (ManagementObject obj in searcher.Get())
                     {
-                        double totalMb = Convert.ToDouble(obj["TotalVisibleMemorySize"]) / 1024; double freeMb = Convert.ToDouble(obj["FreePhysicalMemory"]) / 1024;
-                        txtRam = $"{Math.Round((totalMb - freeMb) / 1024, 1)} GB / {Math.Round(totalMb / 1024, 1)} GB (Load: {Math.Round(((totalMb - freeMb) / totalMb) * 100, 0)}%)"; break;
-                    }
-                }
-                txtGpu = "Searching GPU...";
-                ProcessStartInfo psi = new ProcessStartInfo { FileName = "nvidia-smi", Arguments = "--query-gpu=name,utilization.gpu,power.draw,temperature.gpu --format=csv,noheader,nounits", RedirectStandardOutput = true, UseShellExecute = false, CreateNoWindow = true };
-                using (Process proc = Process.Start(psi))
-                {
-                    string output = proc.StandardOutput.ReadToEnd().Trim();
-                    if (!string.IsNullOrEmpty(output))
-                    {
-                        var parts = output.Split(',');
-                        if (parts.Length >= 4)
-                        {
-                            string smiName = parts[0].Trim().Replace("NVIDIA GeForce ", "").Replace("NVIDIA ", "");
-                            txtGpu = $"{smiName} (Load: {parts[1].Trim()}% | Pwr: {parts[2].Trim()}W | Temp: {parts[3].Trim()}\u00B0C)";
-
-                            if (double.TryParse(parts[1].Trim(), System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out double gpuLoad))
-                                currentGpuLoadPct = gpuLoad;
-                        }
+                        double totalMb = Convert.ToDouble(obj["TotalVisibleMemorySize"]) / 1024; 
+                        double freeMb = Convert.ToDouble(obj["FreePhysicalMemory"]) / 1024;
+                        txtRam = $"{Math.Round((totalMb - freeMb) / 1024, 1)} GB / {Math.Round(totalMb / 1024, 1)} GB (Load: {Math.Round(((totalMb - freeMb) / totalMb) * 100, 0)}%)"; 
+                        break;
                     }
                 }
             }
-            catch
+            catch { txtRam = "RAM (Load: N/A)"; }
+
+            // 3. GPU (NVIDIA via nvidia-smi / Fallback AMD)
+            bool nvidiaSuccess = false;
+
+            if (!nvidiaSmiFailed)
+            {
+                try
+                {
+                    txtGpu = "Searching GPU...";
+                    ProcessStartInfo psi = new ProcessStartInfo 
+                    { 
+                        FileName = "nvidia-smi", 
+                        Arguments = "--query-gpu=name,utilization.gpu,power.draw,temperature.gpu --format=csv,noheader,nounits", 
+                        RedirectStandardOutput = true, 
+                        UseShellExecute = false, 
+                        CreateNoWindow = true 
+                    };
+
+                    using (Process proc = Process.Start(psi))
+                    {
+                        if (proc != null)
+                        {
+                            string output = proc.StandardOutput.ReadToEnd().Trim();
+                            proc.WaitForExit();
+
+                            if (proc.ExitCode == 0 && !string.IsNullOrEmpty(output))
+                            {
+                                var parts = output.Split(',');
+                                if (parts.Length >= 4)
+                                {
+                                    string smiName = parts[0].Trim().Replace("NVIDIA GeForce ", "").Replace("NVIDIA ", "");
+                                    txtGpu = $"{smiName} (Load: {parts[1].Trim()}% | Pwr: {parts[2].Trim()}W | Temp: {parts[3].Trim()}\u00B0C)";
+
+                                    if (double.TryParse(parts[1].Trim(), System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out double gpuLoad))
+                                        currentGpuLoadPct = gpuLoad;
+
+                                    nvidiaSuccess = true;
+                                }
+                            }
+                        }
+                    }
+
+                    if (!nvidiaSuccess)
+                        nvidiaSmiFailed = true;
+                }
+                catch
+                {
+                    nvidiaSmiFailed = true;
+                }
+            }
+
+            // Fallback AMD / Sem NVIDIA
+            if (!nvidiaSuccess)
             {
                 string fallbackGpu = GetMiningGpuName() ?? "Unknown GPU";
                 double amdLoad = GetAmdGpuUtilization();
@@ -1356,6 +1642,8 @@ namespace SaladXRayPanel
 
                 currentGpuLoadPct = amdLoad >= 0 ? amdLoad : 0;
             }
+
+            // 4. DISK
             LoadDiskInfo();
             try
             {
@@ -1373,65 +1661,51 @@ namespace SaladXRayPanel
                         string readStr = readB >= 1048576 ? $"{(readB / 1048576):F1} MB/s" : $"{(readB / 1024):F1} KB/s";
                         string writeStr = writeB >= 1048576 ? $"{(writeB / 1048576):F1} MB/s" : $"{(writeB / 1024):F1} KB/s";
 
-			txtDisk = $"{hostDiskName} {GetDiskFreeSpaceStr()} (Load: {util:F0}% | R: {readStr} W: {writeStr})";
+                        txtDisk = $"{hostDiskName} {GetDiskFreeSpaceStr()} (Load: {util:F0}% | R: {readStr} W: {writeStr})";
                         break;
                     }
                 }
             }
             catch
             {
-			txtDisk = $"{hostDiskName} | {GetDiskFreeSpaceStr()} (I/O Data N/A)";
+                txtDisk = $"{hostDiskName} | {GetDiskFreeSpaceStr()} (I/O Data N/A)";
             }
         }
 
-        static void UpdateWSLData()
-        {
-            try
-            {
-		var wslProcs = Process.GetProcesses();
-		try
+		static void AddLogToScreen(string line)
 		{
-		    long ramTotalBytes = wslProcs
-		        .Where(p => p.ProcessName == "vmmemWSL" || p.ProcessName == "vmmem" || p.ProcessName == "wslhost")
-		        .Sum(p => p.WorkingSet64);
-		    wslRamMB = ramTotalBytes / 1048576.0;
-		    ramUsage = wslRamMB > 0 ? $"{wslRamMB:N1} MB" : "Awaiting WSL...";
+			if (string.IsNullOrWhiteSpace(line)) return;
+
+			recentLogs.RemoveAll(x => x.IsError && (DateTime.Now - x.Timestamp).TotalSeconds > 60);
+
+			// Normaliza tabs -> substitui por espaço único ANTES de qualquer contagem de tamanho,
+			// eliminando a diferença entre Length (char count) e largura visual real no terminal.
+			string normalizedLine = line.Replace("\t", " ").TrimStart();
+
+			const int MaxLineChars = 105;
+			const int CutAt = 102;
+
+			string shortLine = Regex.Replace(normalizedLine, @"^\d{4}-\d{2}-\d{2}\s+(\d{2}:\d{2}:\d{2})\.\d+\s+[-+]\d{2}:\d{2}\s+\[\w{3}\]\s+", "[$1] ");
+			if (shortLine.Length > MaxLineChars) shortLine = shortLine.Substring(0, CutAt) + "...";
+
+			bool isErr = line.Contains("[ERR]");
+			string colorTag = isErr ? "red" : "grey";
+
+			while (recentLogs.Count >= 5)
+				recentLogs.RemoveAt(0);
+
+			recentLogs.Add(new LogItem
+			{
+				FormattedText = $"[{colorTag}]{Markup.Escape(shortLine)}[/]",
+				Timestamp = DateTime.Now,
+				IsError = isErr
+			});
 		}
-		finally
-		{
-		    foreach (var p in wslProcs) p.Dispose();
-		}
-
-                ProcessStartInfo psi = new ProcessStartInfo { FileName = "wsl.exe", Arguments = "-l -v", RedirectStandardOutput = true, UseShellExecute = false, CreateNoWindow = true, StandardOutputEncoding = System.Text.Encoding.Unicode };
-                using (Process proc = Process.Start(psi))
-                {
-                    string output = proc.StandardOutput.ReadToEnd().Replace("\0", "");
-                    var matchWsl = Regex.Match(output, @"salad-enterprise-linux\s+([A-Za-z]+)");
-                    if (matchWsl.Success) { string state = matchWsl.Groups[1].Value; wslStatusStr = state.Contains("Running") ? "Running (Active)" : state.Contains("Stopped") ? "STOPPED (Offline)" : state; }
-                }
-            } catch { wslStatusStr = "Error reading WSL"; wslRamMB = 0; }
-
-            if (wslStatusStr.Contains("STOPPED") || wslStatusStr.Contains("Offline") || wslStatusStr.Contains("Error") || wslStatusStr.Contains("Pending"))
-            {
-                if (containerStatus.Contains("Running"))
-                {
-                    containerStatus = "[yellow]Waiting for WSL...[/]";
-                }
-            }
-        }
-
-        static void AddLogToScreen(string line)
-        {
-            if (string.IsNullOrWhiteSpace(line)) return;
-            string shortLine = Regex.Replace(line, @"^\d{4}-\d{2}-\d{2}\s+(\d{2}:\d{2}:\d{2})\.\d+\s+[-+]\d{2}:\d{2}\s+\[\w{3}\]\s+", "[$1] ");
-            if (shortLine.Length > 85) shortLine = shortLine.Substring(0, 82) + "...";
-            if (recentLogs.Count >= 4) recentLogs.Dequeue(); recentLogs.Enqueue($"[grey]{Markup.Escape(shortLine)}[/]");
-        }
 
         static IRenderable RenderPanel(string filePath)
         {
             // =========================================================================
-            // HELP / ABOUT SCREEN (NEW)
+            // HELP / ABOUT / TROUBLESHOOTING SCREEN (WITH [S] TOGGLE)
             // =========================================================================
             if (showHelpScreen)
             {
@@ -1452,9 +1726,12 @@ namespace SaladXRayPanel
                 helpGrid.AddRow(new Text(""));
 
                 var helpText = new Markup(
-                    "[green bold]Controls & Shortcuts:[/]\n\n" +
                     "[yellow][[CTRL]] [[+ / -]][/] : Zoom in/out on the terminal (Windows default).\n" +
-                    "[yellow][[H]][/]            : Toggle between the Dashboard and this Help screen.\n" +
+                    "[yellow][[N]][/]            : Toggle Novatech demand overlay / view.\n" +
+                    "[yellow][[E]][/]            : Toggle recent events / Error Log panel.\n" +
+                    "[yellow][[C]][/]            : Clear error log history.\n" +
+                    "[yellow][[S]][/]            : Toggle between [cyan]About[/] and [orange1]Troubleshooting[/] panels.\n" +
+                    "[yellow][[H]][/]            : Toggle between Dashboard and this Help screen.\n" +
                     "[yellow][[ESC]][/]          : Safely exit SaladXRay."
                 );
 
@@ -1465,41 +1742,83 @@ namespace SaladXRayPanel
 
                 helpGrid.AddRow(helpPanel);
 
-                var aboutText = new Markup(
-                    "[bold cyan]Born from Agony, Built for Peace of Mind[/]\n\n" +
-                    "[green]SaladXRay[/] exists because of pure agony. Watching a container download " +
-                    "with no idea when it would finish, no transfer rate, no job size, no ETA - just " +
-                    "refreshing the raw logs like a maniac, hoping for a clue. That anxiety is gone now.\n\n" +
-                    "This tool was built to answer the questions Salad itself doesn't show you: " +
-                    "[yellow]how much is downloaded, how fast, and how long until it's done[/]. " +
-                    "Real-time visibility into your hardware, your WSL virtual machine, your container " +
-                    "workload, your wallet, and real-time network demand fetched directly from Salad's public API " +
-                    "- all in one glance.\n\n" +
-                    "[bold cyan][[-h]] Human-Readable Translation:[/] For your absolute peace of mind, SaladXRay is " +
-                    "strictly a read-only tool. No spooky background commands, no system tweaks. It safely builds " +
-                    "this dashboard by simply parsing the Salad log file, tapping into standard Windows APIs, and " +
-                    "reading public data. Just like a real X-Ray, it only observes.\n\n" +
-                    "True story: before development even started, I picked up a container, watched the download " +
-                    "crawl through Task Manager, and right in the middle of it... the power went out. I never " +
-                    "knew how much had downloaded, or how much was left. SaladXRay was born out of exactly " +
-                    "that kind of moment.\n\n" +
-                    "Built in about 15 days total - 5 of them after the first beta - for anyone running " +
-                    "Salad who's ever wanted to actually [bold]understand[/] what's happening under the hood, " +
-                    "instead of just hoping for the best.\n\n" +
-                    "[bold]The hardest bug I ever fixed?[/] My wife. Everything else - WSL quirks, log parsing, " +
-                    "GPU demand APIs - was easy compared to that. [grey](Love you, babe.)[/]\n\n" +
-                    $"[grey]XRay Version:[/] {xrayVersion}\n" +
-                    "[grey]Built with patience (and a very understanding wife) for the community.[/]"
-                );
-                var aboutPanel = new Panel(aboutText)
-                    .Header("[white bold] ABOUT SALAD XRAY [/]", Justify.Left)
-                    .BorderColor(Color.Blue)
-                    .Padding(2, 1, 2, 1);
+                // =========================================================================
+                // ABA 1: TROUBLESHOOTING & SUPPORT GUIDELINES (Ativada com [T])
+                // =========================================================================
+                if (showSupportTab)
+                {
+                    var supportText = new Markup(
+                        "[bold yellow]:warning: Don't Panic Over Isolated Errors & Red Logs![/]\n" +
+                        "Containers, distributed networks, and WSL constantly produce transient warnings. " +
+                        "Seeing an [red][[ERR]][/] line in X-Ray does [italic]not[/] necessarily mean your node is broken " +
+                        "or that you stopped earning.\n\n" +
+                        "Before interrupting any process, [bold yellow]be patient[/] and allow workloads to stabilize before making hasty decisions. " +
+                        "Always check your settings whenever possible: if a clean reinstall is performed (uninstall, reboot, and reinstall) " +
+                        "instead of a direct in-place update, the Salad app resets back to its default settings and everything must be configured again. " +
+                        "Keep these details in mind before seeking support.\n\n" +
+                        "[bold cyan]1. Explore the Official Troubleshooting Hub First:[/]\n" +
+                        "Only if you have already tried everything and still feel something is wrong, head to the official support website and check the [yellow]Troubleshooting[/] section:\n" +
+                        "   [link=https://support.salad.com]https://support.salad.com[/]\n" +
+                        "It is very likely you will solve the issue entirely on your own thanks to the excellent guides and tutorials available there.\n\n" +
+                        "[bold cyan]2. Opening a Support Ticket (Last Resort):[/]\n" +
+                        $"Only open a support ticket as a last resort after trying the troubleshooting guides. "
+                    );
 
-                helpGrid.AddRow(aboutPanel);
+                    var supportPanel = new Panel(supportText)
+                        .Header("[white bold] TROUBLESHOOTING & SUPPORT GUIDELINES [/]", Justify.Left)
+                        .BorderColor(Color.DarkOrange)
+                        .Padding(2, 1, 2, 1);
 
-                var backInstruction = new Markup("\n[blink red]Press [[H]] to go back...[/]");
-                helpGrid.AddRow(new Align(backInstruction, HorizontalAlignment.Center));
+                    helpGrid.AddRow(supportPanel);
+
+                    var navInstruction = new Markup("\n[yellow][[S]][/] View Project Philosophy & About  |  [blink red][[H]][/] Back to Dashboard");
+                    helpGrid.AddRow(new Align(navInstruction, HorizontalAlignment.Center));
+                }
+                // =========================================================================
+                // ABA 2: ABOUT SALAD XRAY (Padrão)
+                // =========================================================================
+                else
+                {
+                    var aboutText = new Markup(
+                        "[bold cyan]Born for Peace of Mind[/]\n\n" +
+                        "[green]SaladXRay[/] exists to streamline monitoring your Salad Node. " +
+                        "Opening Task Manager, fighting with Resource Monitor (resmon), and juggling five " +
+                        "windows just to see if WSL is alive or if a miner started is ridiculous. " +
+                        "Even worse: refreshing web pages manually to check demand APIs until you catch " +
+                        "a red flag on the metrics task.\n\n" +
+                        "Triumphantly, the original spark behind this project was fulfilled even before v1.0 " +
+                        "was released: the natural evolution of the official app, which finally introduced " +
+                        "native container download progress bars with ETA. But SaladXRay didn't stop there " +
+                        "— it evolved.\n\n" +
+                        "Today, this tool delivers the [yellow]entire ecosystem at a single glance[/]: " +
+                        "deep VM/WSL health and real uptime, VM network traffic, workload status, " +
+                        "parallel processes (miners and SGS bandwidth nodes), real-time wallet balance, " +
+                        "and safe, cached GPU demand telemetry (Novatech & Salad).\n\n" +
+                        "All without heavy GUIs, using only [green]~26 MB of RAM[/] (half of Task Manager). " +
+                        "It doesn't steal a single cycle from your compute hardware.\n\n" +
+                        "[bold cyan][[-h]] Human-Readable Translation:[/] For your absolute peace of mind, SaladXRay is " +
+                        "strictly a read-only tool. Zero hidden commands, zero system modifications. " +
+                        "It only reads local logs, native Windows APIs, and public endpoints. " +
+                        "Just like a real X-Ray: through it, you only observe.\n\n" +
+                        "Built for anyone who wants absolute [bold]clarity[/] under the hood instead of " +
+                        "guessing through noisy, generic system tools.\n\n" +
+                        "My sincere gratitude to everyone in the community who tested, supported, and shared " +
+                        "this journey. And of course: [bold]the hardest bug I ever fixed?[/] My wife. Everything " +
+						$"[grey]Love you, babe.[/]\n\n" +
+						$"[link=https://github.com/joseluisfreire]https://github.com/joseluisfreire[/] [grey]XRay Version:[/] {xrayVersion}\n" +
+						"[grey]Built with patience, gratitude, and dedication for the community.[/]"
+                    );
+
+                    var aboutPanel = new Panel(aboutText)
+                        .Header("[white bold] ABOUT SALAD XRAY [/]", Justify.Left)
+                        .BorderColor(Color.Blue)
+                        .Padding(2, 1, 2, 1);
+
+                    helpGrid.AddRow(aboutPanel);
+
+                    var navInstruction = new Markup("\n[yellow][[T]][/] View Support & Troubleshooting  |  [blink red][[H]][/] Back to Dashboard");
+                    helpGrid.AddRow(new Align(navInstruction, HorizontalAlignment.Center));
+                }
 
                 return helpGrid;
             }
@@ -1530,7 +1849,7 @@ namespace SaladXRayPanel
             string uiStr = saladVersion == "Unknown" || saladVersion == "Detecting..." ? uiName : $"{uiName} v{saladVersion}";
             string svcStr = saladBowlVersion == "Offline" || saladBowlVersion == "Unknown" || saladBowlVersion == "Detecting..." ? svcName : $"{svcName} v{saladBowlVersion}";
 
-            string titleText = $"[yellow bold]{xrayName} v{xrayVersion} [[ESC]] Exit [[H]] Help/About[/]";
+            string titleText = $"[yellow bold]{xrayName} v{xrayVersion} [[ESC]] Exit [[H]] Help[/]";
 
 		var infoPanel = CreateBannerPanel(titleText, new Dictionary<string, string> {
 		    { "APP VERSION", $"[green]{Markup.Escape(uiStr)}[/]" },
@@ -1572,7 +1891,18 @@ namespace SaladXRayPanel
             grid.AddRow(CreateSection("EARNINGS", new Dictionary<string, string> { { ":money_bag: WALLET", $"[bold green]${balance}[/] | 24H EST: [bold yellow]${projected}[/] | UPDATED: {lastUpdateTimer}" } }));
 
             string wslColor = wslStatusStr.Contains("Running") ? "green" : wslStatusStr.Contains("STOPPED") ? "red" : "yellow";
-            grid.AddRow(CreateSection("LINUX WSL (VIRTUAL MACHINE)", new Dictionary<string, string> { { ":desktop_computer: VM STATUS", $"[{wslColor}]{wslStatusStr}[/]" }, { ":floppy_disk: VM RAM", ramUsage }, { ":optical_disk: VM DISK", wslDiskSize }, { ":satellite_antenna: VM LAN", vNetStats } }));
+            
+            // Se estiver Running, mostra o status + relógio + tempo. Se estiver Off/qualquer outra coisa, mostra apenas o status limpo!
+            string wslDisplayStatus = wslStatusStr.Contains("Running")
+                ? $"[{wslColor}]{Markup.Escape(wslStatusStr)}[/]  :alarm_clock: {workTime}"
+                : $"[{wslColor}]{Markup.Escape(wslStatusStr)}[/]";
+
+            grid.AddRow(CreateSection("LINUX WSL (VIRTUAL MACHINE)", new Dictionary<string, string> { 
+                { ":desktop_computer: VM STATUS", wslDisplayStatus }, 
+                { ":floppy_disk: VM RAM", ramUsage }, 
+                { ":optical_disk: VM DISK", wslDiskSize }, 
+                { ":satellite_antenna: VM LAN", vNetStats } 
+            }));
 
             string heart = ":broken_heart:";
             if ((DateTime.Now - lastLogHeartbeat).TotalMinutes < 2)
@@ -1582,18 +1912,25 @@ namespace SaladXRayPanel
 
             string matrixStatusWithHeart = $"{matrixStatus} {heart}";
 
-            string displayContainerStatus = containerStatus;
-            if (isPullingState && globalProgress >= 98.0 && currentVmDownKbps < 1024 && wslRamMB > 800)
+            string displayContainerStatus;
+            if (containerStatus.Contains("Running"))
+            {
+                displayContainerStatus = "[bold green]Running (Active)[/]";
+            }
+            else if (isPullingState && globalProgress >= 98.0 && currentVmDownKbps < 1024 && wslRamMB > 800)
             {
                 displayContainerStatus = $"[cyan]Unpacking / Extracting... (WSL RAM Spike: {wslRamMB:N0} MB | Low Net I/O)[/]";
             }
+            else
+            {
+                displayContainerStatus = containerStatus;
+            }
 
-            grid.AddRow(CreateSection("SALAD CONTAINER WORKLOAD", new Dictionary<string, string> {
-                { ":satellite: MATRIX STATE", matrixStatusWithHeart },
-                { ":id_button: WORKLOAD ID", jobId },
-                { ":package: CONTAINER", displayContainerStatus },
-                { ":stopwatch: UPTIME", workTime }
-            }));
+			grid.AddRow(CreateSection("SALAD CONTAINER WORKLOAD", new Dictionary<string, string> {
+				{ ":satellite: MATRIX STATE", matrixStatusWithHeart },
+				{ ":id_button: TYPE / ID", $"{workloadHardwareType} [grey]/[/] {Markup.Escape(jobId)}" },
+				{ ":package: CONTAINER", displayContainerStatus }
+			}));
 
             grid.AddRow(CreateSection("GLOBAL HARDWARE (HOST)", new Dictionary<string, string> {
                 { ":gear: HOST CPU", txtCpu },
@@ -1602,43 +1939,104 @@ namespace SaladXRayPanel
                 { ":floppy_disk: HOST DISK", txtDisk }
             }));
 
-            grid.AddRow(CreateSection("SALAD GPU DEMAND", new Dictionary<string, string> {
-                { ":fire: GPU MATCH", gpuDemandStatus },
-                { ":gem_stone: DEMAND", gpuDemandTier },
-                { ":chart_increasing: NET UTIL", gpuNetworkUtil },
-                { ":money_bag: 24H EST", gpuEarning24h }
-            }));
+            Dictionary<string, string> gpuDemandItems;
+            string demandSourceLabel;
 
-            var hostWorkloads = new Dictionary<string, string> { { ":pick: GPU MINER", minerStatus }, { ":globe_with_meridians: SGS NODE", bandwidthStatus.Contains("Idle") ? "[grey]Idle[/]" : $"[magenta]{sgsNodeName}[/]" } };
-            if (!bandwidthStatus.Contains("Idle")) { hostWorkloads.Add(":satellite_antenna: SGS I/O", sgsDetails); hostWorkloads.Add(":chart_increasing: SGS TRAFFIC", $"[magenta]{sgsTotalTraffic}[/]"); }
-            grid.AddRow(CreateSection("WINDOWS HOST WORKLOADS", hostWorkloads));
+            if (useNovaDemandView && isNovaOnline)
+            {
+                demandSourceLabel = "NOVATECH";
 
-            var logsArray = recentLogs.ToArray();
-            var errorTable = new Table().HideHeaders().Border(TableBorder.None).Expand();
-            errorTable.AddColumn(new TableColumn("Label").Width(15).NoWrap()); errorTable.AddColumn(new TableColumn("Value").NoWrap());
-		string errColor = lastErrorLevel switch
-		{
-		    "ERR" => "red",
-		    "WRN" => "yellow",
-		    _ => "grey"
-		};
+                string novaUtilStr = novaUtil.HasValue
+                    ? $"[yellow]{Math.Round(novaUtil.Value, 1)}%[/]"
+                    : "[grey]N/A[/]";
 
-		string levelLabel = lastErrorLevel switch
-		{
-		    "ERR" => "Error",
-		    "WRN" => "Warning",
-		    _ => "Error"
-		};
+                string novaEarnStr = (novaMinEarning.HasValue && novaMaxEarning.HasValue)
+                    ? $"Min: [bold green]${novaMinEarning.Value:F2}[/] / Max: [bold green]${novaMaxEarning.Value:F2}[/]"
+                    : "[grey]N/A[/]";
 
-		errorTable.AddRow(
-		    new Markup($"[{errColor}]:warning: Last {levelLabel}[/]"),
-		    new Markup($"[white]:[/] {TruncateWithColors($"[{errColor}]{Markup.Escape(lastWarning)}[/]", Math.Max(10, AnsiConsole.Profile.Width - 25))}")
-		);
+                gpuDemandItems = new Dictionary<string, string> {
+                    { ":fire: GPU MATCH", novaMatchStatus },
+                    { ":gem_stone: DEMAND", novaTier != null ? $"[cyan]{Markup.Escape(novaTier)}[/]" : "[grey]N/A[/]" },
+                    { ":chart_increasing: NET UTIL", novaUtilStr },
+                    { ":money_bag: 24H EST", novaEarnStr }
+                };
+            }
+            else
+            {
+                demandSourceLabel = "SALAD";
 
-            int logMaxWidth = Math.Max(20, AnsiConsole.Profile.Width - 8);
-            var logsBlock = new Markup($"  {TruncateWithColors(logsArray.Length > 0 ? logsArray[0] : "", logMaxWidth)}\n  {TruncateWithColors(logsArray.Length > 1 ? logsArray[1] : "", logMaxWidth)}\n  {TruncateWithColors(logsArray.Length > 2 ? logsArray[2] : "", logMaxWidth)}\n  {TruncateWithColors(logsArray.Length > 3 ? logsArray[3] : "", logMaxWidth)}");
+                gpuDemandItems = new Dictionary<string, string> {
+                    { ":fire: GPU MATCH", gpuDemandStatus },
+                    { ":gem_stone: DEMAND", gpuDemandTier },
+                    { ":chart_increasing: NET UTIL", gpuNetworkUtil },
+                    { ":money_bag: 24H EST", gpuEarning24h }
+                };
+            }
 
-            grid.AddRow(new Panel(new Rows(errorTable, logsBlock)).Header("[cyan][[ RECENT EVENTS ]][/]").BorderColor(Color.Cyan).Expand());
+            grid.AddRow(CreateSection($"GPU DEMAND [{demandSourceLabel}] (Press [N] to switch)", gpuDemandItems));
+
+			string sgsUptimeStr = sgsStartTime != DateTime.MinValue ? FormatUptime(DateTime.Now - sgsStartTime) : "Offline";
+			string sgsColor = sgsStatus == "Online" ? "green" : "grey";
+
+			string sgsOneLine = sgsStatus == "Online"
+				? $"[{sgsColor}]{sgsStatus}[/] | Up: {sgsUptimeStr} | CPU: {sgsCpuUsagePct:F1}% | RAM: {sgsRamMB2:F1} MB | Net: {sgsNetworkSpeed}"
+				: "[grey]Offline[/]";
+
+			var hostWorkloads = new Dictionary<string, string>
+			{
+				{ ":globe_with_meridians: SGS CLIENT", sgsOneLine }
+			};
+
+			grid.AddRow(CreateSection("WINDOWS HOST WORKLOADS", hostWorkloads));
+
+            // Se houver algum erro velho na lista no momento do render, descarta também
+            recentLogs.RemoveAll(x => x.IsError && (DateTime.Now - x.Timestamp).TotalSeconds > 60);
+
+			var logsArray = recentLogs.Select(x => x.FormattedText).ToArray();
+			int logMaxWidth = Math.Max(20, AnsiConsole.Profile.Width - 8);
+
+			var logsBlock = new Markup(
+				$"  {TruncateWithColors(logsArray.Length > 0 ? logsArray[0] : "", logMaxWidth)}\n" +
+				$"  {TruncateWithColors(logsArray.Length > 1 ? logsArray[1] : "", logMaxWidth)}\n" +
+				$"  {TruncateWithColors(logsArray.Length > 2 ? logsArray[2] : "", logMaxWidth)}\n" +
+				$"  {TruncateWithColors(logsArray.Length > 3 ? logsArray[3] : "", logMaxWidth)}\n" +
+				$"  {TruncateWithColors(logsArray.Length > 4 ? logsArray[4] : "", logMaxWidth)}"
+			);
+
+			int errValWidth = Math.Max(10, AnsiConsole.Profile.Width - 25);
+			var errorLines = new List<IRenderable>();
+
+			if (showErrorHistory)
+			{
+				var errors = errorHistory.Reverse().ToList();
+
+				for (int i = 0; i < MaxErrorHistory; i++)
+				{
+					if (i < errors.Count)
+					{
+						var e = errors[i];
+						string line = $"[grey]{e.Timestamp:HH:mm:ss}[/] [white]:[/] {TruncateWithColors($"[red]{Markup.Escape(e.Message)}[/]", errValWidth)}";
+						errorLines.Add(new Markup(line));
+					}
+					else
+					{
+						errorLines.Add(new Markup(" "));
+					}
+				}
+			}
+
+			string eColor = errorHistory.Count > 0 ? "indianred1" : "cyan";
+
+			string errorHeaderTitle = showErrorHistory
+				? $"[cyan][[ ERROR HISTORY ([{eColor}][[E]][/] back | [[C]] clear) ]][/]"
+				: $"[cyan][[ RECENT EVENTS ([{eColor}][[E]][/] history) ]][/]";
+
+			grid.AddRow(
+				new Panel(showErrorHistory ? (IRenderable)new Rows(errorLines) : logsBlock)
+					.Header(errorHeaderTitle)
+					.BorderColor(Color.Cyan)
+					.Expand()
+			);
 
             return grid;
         }
@@ -1663,23 +2061,67 @@ namespace SaladXRayPanel
 	// adapt icons w10
 	static string AdaptIcon(string label)
 	{
-	    if (!isLegacyEmojiMode || string.IsNullOrEmpty(label)) return label;
+		if (string.IsNullOrEmpty(label)) return label;
 
-	    if (_adaptIconCache.TryGetValue(label, out var cached))
-	        return cached;
+		if (_adaptIconCache.TryGetValue(label, out var cached))
+			return cached;
 
-	    string result = EmojiShortcodeRegex.Replace(label, "-").TrimStart();
-	    _adaptIconCache[label] = result;
-	    return result;
+		string result;
+
+		if (isLegacyEmojiMode)
+		{
+			// Substitui cada :shortcode: pelo Unicode correspondente (fallback real)
+			result = EmojiShortcodeRegex.Replace(label, match =>
+			{
+				return EmojiFallbackMap.TryGetValue(match.Value, out var unicodeChar)
+					? unicodeChar + " "
+					: ""; // shortcode desconhecido: remove silenciosamente
+			}).TrimStart();
+		}
+		else
+		{
+			result = label;
+		}
+
+		_adaptIconCache[label] = result;
+		return result;
 	}
+	static Panel CreateSection(string title, Dictionary<string, string> items)
+	{
+		var table = new Table().HideHeaders().Border(TableBorder.None).Expand();
+		table.AddColumn(new TableColumn("Label").Width(15).NoWrap()); 
+		table.AddColumn(new TableColumn("Value").NoWrap());
 
-        static Panel CreateSection(string title, Dictionary<string, string> items)
-        {
-            var table = new Table().HideHeaders().Border(TableBorder.None).Expand();
-            table.AddColumn(new TableColumn("Label").Width(15).NoWrap()); table.AddColumn(new TableColumn("Value").NoWrap());
-	    foreach (var item in items) table.AddRow(new Markup($"[white]{Markup.Escape(AdaptIcon(item.Key ?? ""))}[/]"), new Markup($"[white]:[/] {TruncateWithColors(item.Value ?? "", Math.Max(10, AnsiConsole.Profile.Width - 25))}"));
-            return new Panel(table).Header($"[cyan][[ {Markup.Escape(title)} ]][/]").BorderColor(Color.Cyan).Expand();
-        }
+		foreach (var item in items)
+		{
+			string rawVal = item.Value ?? "";
+			string truncatedVal = TruncateWithColors(rawVal, Math.Max(10, AnsiConsole.Profile.Width - 25));
+
+			Markup valueMarkup;
+			try
+			{
+				// Tenta renderizar normalmente (com cores legítimas)
+				valueMarkup = new Markup($"[white]:[/] {truncatedVal}");
+			}
+			catch
+			{
+				// Se vier [N/A], [N/B], [Not Supported] ou qualquer colchete desconhecido,
+				// escapa o valor e nunca mais quebra o dashboard!
+				string safeVal = TruncateWithColors(Markup.Escape(rawVal), Math.Max(10, AnsiConsole.Profile.Width - 25));
+				valueMarkup = new Markup($"[white]:[/] {safeVal}");
+			}
+
+			table.AddRow(
+				new Markup($"[white]{Markup.Escape(AdaptIcon(item.Key ?? ""))}[/]"), 
+				valueMarkup
+			);
+		}
+
+		return new Panel(table)
+			.Header($"[cyan][[ {Markup.Escape(title)} ]][/]")
+			.BorderColor(Color.White)
+			.Expand();
+	}
 
         static Panel CreateBannerPanel(string title, Dictionary<string, string> items)
         {
@@ -1845,5 +2287,29 @@ namespace SaladXRayPanel
     {
         [JsonPropertyName("ramGb")]
         public int RamGb { get; set; }
+    }
+
+    public class NovatechResponse
+    {
+        [JsonPropertyName("gpus")]
+        public List<NovatechGpuData> Gpus { get; set; }
+    }
+
+    public class NovatechGpuData
+    {
+        [JsonPropertyName("displayName")]
+        public string DisplayName { get; set; }
+
+        [JsonPropertyName("demandTier")]
+        public string DemandTier { get; set; }
+
+        [JsonPropertyName("utilization")]
+        public double Utilization { get; set; }
+
+        [JsonPropertyName("minEarningRate")]
+        public double? MinEarningRate { get; set; }
+
+        [JsonPropertyName("maxEarningRate")]
+        public double? MaxEarningRate { get; set; }
     }
 }
