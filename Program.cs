@@ -1951,14 +1951,14 @@ namespace SaladXRayPanel
                     : "[grey]N/A[/]";
 
                 string novaEarnStr = (novaMinEarning.HasValue && novaMaxEarning.HasValue)
-                    ? $"Min: [bold green]${novaMinEarning.Value:F2}[/] / Max: [bold green]${novaMaxEarning.Value:F2}[/]"
+                    ? $"Min: [bold green]${novaMinEarning.Value:F3}[/] / Max: [bold green]${novaMaxEarning.Value:F3}[/]"
                     : "[grey]N/A[/]";
 
                 gpuDemandItems = new Dictionary<string, string> {
                     { ":fire: GPU MATCH", novaMatchStatus },
                     { ":gem_stone: DEMAND", novaTier != null ? $"[cyan]{Markup.Escape(novaTier)}[/]" : "[grey]N/A[/]" },
                     { ":chart_increasing: NET UTIL", novaUtilStr },
-                    { ":money_bag: 24H EST", novaEarnStr }
+                    { ":money_bag: HOURLY EST", novaEarnStr }
                 };
             }
             else
