@@ -7,9 +7,13 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     
-    <Version>1.0.1</Version>
+    <Version>1.1.2</Version>
     <AssemblyVersion>1.0.0.0</AssemblyVersion>
-    <FileVersion>1.0.0.20260915.5</FileVersion>
+    <FileVersion>1.1.2.2026</FileVersion>
+  <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+  <TieredPGO>false</TieredPGO>
+  <InvariantGlobalization>true</InvariantGlobalization>
+  <AutoreleasePoolSupport>false</AutoreleasePoolSupport>
   </PropertyGroup>
 
   <ItemGroup>
@@ -17,7 +21,7 @@
     <PackageReference Include="Spectre.Console.ImageSharp" Version="0.57.2" />
     <PackageReference Include="System.Diagnostics.PerformanceCounter" Version="10.0.10" />
     <PackageReference Include="System.Management" Version="10.0.10" />
-    <EmbeddedResource Include="smslant.flf" />
+	<EmbeddedResource Include="Fonts\*.flf" LogicalName="%(Filename)%(Extension)" />
   </ItemGroup>
 
 </Project>
